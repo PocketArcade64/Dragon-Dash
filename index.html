@@ -291,7 +291,32 @@ const Audio_ = {
     tick();
   },
   stopMusic(){ if(this.musicTimer){ clearTimeout(this.musicTimer); this.musicTimer=null; } },
-  setBiome(i){ this.biomeIdx=Math.min(i,this.scales.length-1); }
+  setBiome(i){ this.biomeIdx=Math.min(i,this.scales.length-1); },
+  // ---- TITLE MUSIC: gentle looping melody over a soft pad ----
+  titleTimer:null, titleStep:0,
+  // a wandering minor-key melody (semitone offsets from a low root)
+  titleMelody:[0,7,3,10,7,12,10,7,3,5,3,0,7,10,12,15,12,10,7,3],
+  titleRoot:147, // D3-ish
+  startTitleMusic(){
+    if(this.titleTimer||!this.ctx) return;
+    this.titleStep=0;
+    const step=()=>{
+      const mel=this.titleMelody, n=mel[this.titleStep%mel.length];
+      const f=this.titleRoot*Math.pow(2,n/12);
+      // lead melody
+      this.tone(f*2,0.30,'triangle',0.12,0,null,this.musicGain);
+      // soft echo a beat behind
+      this.tone(f*2,0.22,'sine',0.05,0.16,null,this.musicGain);
+      // bass root every two steps
+      if(this.titleStep%2===0) this.tone(this.titleRoot,0.42,'sine',0.13,0,null,this.musicGain);
+      // sparkle on phrase peaks
+      if(n>=12) this.tone(f*4,0.18,'sine',0.045,0,null,this.musicGain);
+      this.titleStep++;
+      this.titleTimer=setTimeout(step,300);
+    };
+    step();
+  },
+  stopTitleMusic(){ if(this.titleTimer){ clearTimeout(this.titleTimer); this.titleTimer=null; } }
 };
 
 // ============================================================
@@ -783,10 +808,21 @@ function onPointerDown(e){
   const p=canvasPos(e); pointer=p;
   if(state==='settings'){ dragActive=true; dragLastY=p.y; dragMoved=0; }
   if(state==='playing'){ if(!hitTest(p)) jump(); return; }
+  if(state==='select' && p.y>=CARD_Y-6 && p.y<=CARD_Y+CARD_H+6){
+    // begin horizontal carousel drag
+    carDrag=true; carDragStartX=p.x; carDragStartScroll=carScroll; carDragMoved=0;
+    pendingTap=p; return;
+  }
   if(state==='settings'){ pendingTap=p; return; }  // decide tap vs drag on release
   hitTest(p);
 }
 function onPointerMove(e){
+  if(carDrag && state==='select'){
+    const cx=(e.touches?e.touches[0].clientX:e.clientX);
+    const r=cv.getBoundingClientRect(); const wx=(cx-r.left)*(VW/r.width)-OX;
+    const dx=carDragStartX-wx; carScroll=carDragStartScroll+dx; carDragMoved+=Math.abs(wx-(pointer.x));
+    pointer.x=wx; e.preventDefault(); return;
+  }
   if(!dragActive || state!=='settings') return;
   const cy=(e.touches?e.touches[0].clientY:e.clientY);
   const r=cv.getBoundingClientRect(); const wy=(cy-r.top)*(CONFIG.H/r.height);
@@ -794,6 +830,12 @@ function onPointerMove(e){
   e.preventDefault();
 }
 function onPointerUp(){
+  if(carDrag && state==='select'){
+    const stride=CARD_W+CARD_GAP;
+    if(carDragMoved<8 && pendingTap){ hitTest(pendingTap); }   // it was a tap, not a drag
+    else { carIndex = clamp(Math.round(carScroll/stride), 0, CAROUSEL.length-1); }  // snap
+    carDrag=false; pendingTap=null; return;
+  }
   if(state==='settings' && pendingTap && dragMoved<6){ hitTest(pendingTap); }
   pendingTap=null; dragActive=false;
 }
@@ -818,13 +860,13 @@ window.addEventListener('keydown', e=>{
     else if(state==='paused') resumeGame();
   }
   if(state==='gameover_name'){
-    if(/^[a-zA-Z0-9]$/.test(e.key) && nameEntry.length<8){ nameEntry+=e.key.toUpperCase(); Audio_.type(); }
-    else if(e.key==='Backspace'){ nameEntry=nameEntry.slice(0,-1); Audio_.type(); }
+    if(/^[a-zA-Z0-9]$/.test(e.key) && nameEntry.length<8){ const c=e.key.toUpperCase(); nameEntry+=c; kbPress(c); Audio_.type(); }
+    else if(e.key==='Backspace'){ nameEntry=nameEntry.slice(0,-1); kbPress('\b'); Audio_.type(); }
     else if(e.key==='Enter'){ commitName(); }
   }
   if(state==='settings' && settingsView==='dev'){
-    if(/^[a-zA-Z0-9]$/.test(e.key) && devEntry.length<16){ devEntry+=e.key.toUpperCase(); Audio_.type(); }
-    else if(e.key==='Backspace'){ devEntry=devEntry.slice(0,-1); Audio_.type(); }
+    if(/^[a-zA-Z0-9]$/.test(e.key) && devEntry.length<16){ const c=e.key.toUpperCase(); devEntry+=c; kbPress(c); Audio_.type(); }
+    else if(e.key==='Backspace'){ devEntry=devEntry.slice(0,-1); kbPress('\b'); Audio_.type(); }
     else if(e.key==='Enter'){ devSubmit(); }
   }
 });
@@ -930,12 +972,6 @@ function drawWorld(){
   for(const c of G.coins) drawCoin(c.x,c.y,CONFIG.COIN_R,c.kind);
   for(const p of G.powerups) drawPowerup(p);
 
-  // dragon trail
-  if(!G.dead && state==='playing'){
-    ctx.fillStyle=G.dragon.trail;
-    for(let i=1;i<=4;i++){ ctx.globalAlpha=0.18-i*0.03; ctx.beginPath(); ctx.arc(G.x-i*9, G.y+rnd(-2,2), 5-i, 0,7); ctx.fill(); }
-    ctx.globalAlpha=1;
-  }
   // dragon
   const scale=(G.timers.tiny>0?0.5:1);
   let alpha=1, tint=null;
@@ -1041,6 +1077,16 @@ function drawObstacle(o,b){
     drawCaveColumn(o,b, tipDn, CONFIG.H, false);
     return;
   }
+  if(b.tip==='ice'){                 // ICE: frozen dripping spires (cave shape, icy theme)
+    drawIceColumn(o,b, CONFIG.HUD_H, tipUp, true);
+    drawIceColumn(o,b, tipDn, CONFIG.H, false);
+    return;
+  }
+  if(b.tip==='lava'){                // LAVA: molten basalt spires (cave shape, fiery theme)
+    drawLavaColumn(o,b, CONFIG.HUD_H, tipUp, true);
+    drawLavaColumn(o,b, tipDn, CONFIG.H, false);
+    return;
+  }
   const w=pxs(o.w), x=Math.round(o.x - w/2);
   const TIPLEN = 30;
   drawColumn(o,b,x,w, CONFIG.HUD_H, tipUp, true,  TIPLEN);  // ceiling piece
@@ -1069,6 +1115,73 @@ function drawCaveColumn(o,b,topY,botY,isCeil){
     const r=h2(o.seed, y, 13), inner=Math.max(0,rowW-PX*5);
     if(r>0.88 && inner>0){ ctx.fillStyle=b.oLight; ctx.fillRect(rowX+PX*2+Math.round((r%0.25/0.25)*inner), y, PX, PX); }
   }
+}
+// shared organic spire shape used by ice & lava (mirrors drawCaveColumn)
+function spireHalfWidth(o,maxHalf,t,y){
+  let hw = maxHalf * (Math.sqrt(Math.max(0,1-t))*0.88 + 0.14*Math.sin(t*Math.PI));
+  if(t<0.12) hw = Math.max(hw, maxHalf*(1.0 + (0.12-t)*1.6));
+  hw += (h2(o.seed,y,9)-0.5)*PX*1.1;
+  return hw;
+}
+// ICE: frozen crystalline spire — cool body, faceted left-light highlight, sparkle flecks
+function drawIceColumn(o,b,topY,botY,isCeil){
+  const w=pxs(o.w), cx=Math.round(o.x);
+  const maxHalf=w/2;
+  const attach = isCeil ? topY : botY;
+  const len = Math.max(PX, botY-topY);
+  for(let y=pxs(topY); y<botY; y+=PX){
+    const t = Math.min(1, Math.abs((y+PX/2)-attach)/len);
+    let hw = spireHalfWidth(o,maxHalf,t,y);
+    hw = Math.max(t>0.9?PX:PX*2, Math.round(hw));
+    const rowW=Math.round(hw*2), rowX=Math.round(cx-hw);
+    if(rowW<PX) continue;
+    ctx.fillStyle=b.oMid;   ctx.fillRect(rowX, y, rowW, PX);            // icy body
+    ctx.fillStyle=b.oLight; ctx.fillRect(rowX, y, PX*2, PX);            // bright lit rim
+    ctx.fillStyle=b.oDark;  ctx.fillRect(rowX+rowW-PX*2, y, PX*2, PX);  // cool shadow edge
+    // vertical crystalline facet seams (stable)
+    if(rowW>PX*5){ ctx.fillStyle=b.oLight; ctx.globalAlpha=0.5;
+      ctx.fillRect(rowX+Math.round(rowW*0.4), y, PX, PX); ctx.globalAlpha=1; }
+    // bright sparkle flecks
+    const r=h2(o.seed, y, 13), inner=Math.max(0,rowW-PX*5);
+    if(r>0.9 && inner>0){ ctx.fillStyle=b.acc2; ctx.fillRect(rowX+PX*2+Math.round((r%0.25/0.25)*inner), y, PX, PX); }
+  }
+  // glinting tip highlight
+  const tipY = isCeil ? botY-PX*2 : topY;
+  ctx.fillStyle=b.acc2; ctx.globalAlpha=0.6+0.4*Math.sin(G.frame*0.15+o.seed);
+  ctx.fillRect(cx-PX, tipY, PX*2, PX); ctx.globalAlpha=1;
+}
+// LAVA: molten basalt spire — dark rock body with a glowing, pulsing molten core seam
+function drawLavaColumn(o,b,topY,botY,isCeil){
+  const w=pxs(o.w), cx=Math.round(o.x);
+  const maxHalf=w/2;
+  const attach = isCeil ? topY : botY;
+  const len = Math.max(PX, botY-topY);
+  const pulse = 0.55+0.45*Math.sin(G.frame*0.12+o.seed);
+  for(let y=pxs(topY); y<botY; y+=PX){
+    const t = Math.min(1, Math.abs((y+PX/2)-attach)/len);
+    let hw = spireHalfWidth(o,maxHalf,t,y);
+    hw = Math.max(t>0.9?PX:PX*2, Math.round(hw));
+    const rowW=Math.round(hw*2), rowX=Math.round(cx-hw);
+    if(rowW<PX) continue;
+    ctx.fillStyle=b.oMid;   ctx.fillRect(rowX, y, rowW, PX);            // basalt body
+    ctx.fillStyle=b.oLight; ctx.fillRect(rowX, y, PX*2, PX);            // warm lit rim
+    ctx.fillStyle=b.oDark;  ctx.fillRect(rowX+rowW-PX*2, y, PX*2, PX);  // charred shadow
+    // glowing molten core seam down the centre (brighter the wider the rock)
+    if(rowW>PX*4){
+      const coreW=Math.max(PX, Math.round(rowW*0.22));
+      ctx.globalAlpha=0.55+0.4*pulse; ctx.fillStyle=b.accent;
+      ctx.fillRect(cx-Math.round(coreW/2), y, coreW, PX);
+      ctx.globalAlpha=0.9*pulse; ctx.fillStyle=b.acc2;
+      ctx.fillRect(cx-PX/2|0, y, PX, PX); ctx.globalAlpha=1;
+    }
+    // ember flecks
+    const r=h2(o.seed, y, 13), inner=Math.max(0,rowW-PX*5);
+    if(r>0.92 && inner>0){ ctx.globalAlpha=pulse; ctx.fillStyle=b.acc2; ctx.fillRect(rowX+PX*2+Math.round((r%0.25/0.25)*inner), y, PX, PX); ctx.globalAlpha=1; }
+  }
+  // molten glow at the tip
+  const tipY = isCeil ? botY-PX*3 : topY;
+  ctx.globalAlpha=0.5+0.5*pulse; ctx.fillStyle=b.acc2;
+  ctx.fillRect(cx-PX, tipY, PX*2, PX*2); ctx.globalAlpha=1;
 }
 function drawColumn(o,b,x,w,top,bot,isCeil,tipLen){
   top=pxs(top); bot=pxs(bot);
@@ -1284,9 +1397,8 @@ function drawMenuBG(w){
   if(!menuStars){ menuStars=[]; for(let i=0;i<70;i++) menuStars.push({x:Math.random(),y:Math.random()*0.5,p:Math.random()*6.28,s:Math.random()<0.25?2:1}); }
   for(const s of menuStars){ const tw=0.5+0.5*Math.sin(TICK*0.05+s.p); ctx.globalAlpha=0.25+0.6*tw; ctx.fillStyle='#fff'; ctx.fillRect(Math.round(s.x*w),Math.round(s.y*CONFIG.H),s.s,s.s); }
   ctx.globalAlpha=1;
-  // moon (crescent)
-  ctx.fillStyle='#efe8ff'; ctx.beginPath(); ctx.arc(w*0.78, CONFIG.H*0.15, 24,0,7); ctx.fill();
-  ctx.fillStyle='#27124c'; ctx.beginPath(); ctx.arc(w*0.78+9, CONFIG.H*0.15-6, 21,0,7); ctx.fill();
+  // moon (pixel art crescent)
+  drawPixelMoon(Math.round(w*0.78), Math.round(CONFIG.H*0.15), 5);
   // parallax pixel hills
   menuHills(w,'#241a44', 0.18, 150, 7);
   menuHills(w,'#33245e', 0.42, 95, 13);
@@ -1300,6 +1412,25 @@ function drawMenuBG(w){
       ctx.globalAlpha=0.92; ctx.drawImage(s.img, d.f*s.fw,0,s.fw,s.fh, Math.round(d.x-dw/2), Math.round(d.y-dh/2), dw,dh); ctx.globalAlpha=1; } }
   menuDragons=menuDragons.filter(d=>d.x<w+90);
 }
+// pixel-art crescent moon: a full disc of pixels with a bite taken out, plus craters
+const MOON_R=7;
+function drawPixelMoon(cx,cy,px){
+  const r=MOON_R, off=3;
+  for(let gy=-r;gy<=r;gy++){
+    for(let gx=-r;gx<=r;gx++){
+      if(gx*gx+gy*gy > r*r) continue;
+      const dx=gx-off, dy=gy-1;
+      if(dx*dx+dy*dy <= (r-0.4)*(r-0.4)) continue; // crescent bite
+      const edge = gx*gx+gy*gy > (r-1.1)*(r-1.1);
+      ctx.fillStyle = edge ? '#fffbe8' : '#e9e1ff';
+      ctx.fillRect(cx+gx*px, cy+gy*px, px, px);
+    }
+  }
+  ctx.fillStyle='#c9bff0';
+  ctx.fillRect(cx-4*px, cy-2*px, px, px);
+  ctx.fillRect(cx-5*px, cy+1*px, px, px);
+  ctx.fillRect(cx-2*px, cy+3*px, px, px);
+}
 function menuHills(w,color,speed,amp,seed){
   ctx.fillStyle=color;
   const off=TICK*speed;
@@ -1312,14 +1443,13 @@ function drawSelect(){
   buttons=[];
   ctx.save(); ctx.translate(-OX,0); drawMenuBG(VW); ctx.restore();   // full-width animated bg
   text('DRAGON DASH', CONFIG.W/2, 90, '#F5C518', 20);
-  // stats row
-  drawCoin(40,140,9,'normal'); text(SAVE.coins, 56, 140, '#F5C518', 12, 'left');
-  text('BEST '+SAVE.high, CONFIG.W-20, 140, '#888', 10, 'right');
+  // stats row: HIGHSCORE on the left, coin total on the right
+  text('HIGHSCORE: '+SAVE.high, 20, 140, '#888', 10, 'left');
+  text(SAVE.coins, CONFIG.W-20, 140, '#F5C518', 12, 'right');
+  drawCoin(CONFIG.W-20-(''+SAVE.coins).length*9-16, 140, 9, 'normal');
   text('CHOOSE YOUR DRAGON', CONFIG.W/2, 180, '#888', 9);
 
-  // cards
-  drawDragonCard('fire', 20, 215, 165, 230);
-  drawDragonCard('ice', 205, 215, 165, 230);
+  drawDragonCarousel();
 
   // FLY button -> choose starting environment
   const d=DRAGONS[SAVE.dragon];
@@ -1333,6 +1463,72 @@ function drawSelect(){
   drawDragonSprite(CONFIG.W/2, 720, 1.6, Math.floor(performance.now()/130)%3, 0, 1, null);
   // settings gear (top-right of the column)
   gearButton(CONFIG.W-34, SAFE_TOP+30, ()=>{ Audio_.click(); settingsReturn='select'; settingsView='main'; settingsScroll=0; state='settings'; });
+}
+// ---- horizontal dragon carousel ----
+const CAROUSEL = ['fire','ice','soon','soon'];
+let carIndex = 0;          // which card is centered
+let carScroll = 0;         // animated px offset (eases toward carIndex)
+let carDrag = false, carDragStartX=0, carDragStartScroll=0, carDragMoved=0;
+const CARD_W = 200, CARD_H = 230, CARD_GAP = 24, CARD_Y = 215;
+function carouselInit(){
+  // center the currently-selected dragon on entry
+  const i = CAROUSEL.indexOf(SAVE.dragon); if(i>=0) carIndex=i;
+  carScroll = carIndex*(CARD_W+CARD_GAP);
+}
+function drawDragonCarousel(){
+  const stride = CARD_W+CARD_GAP;
+  const target = carIndex*stride;
+  if(!carDrag) carScroll += (target-carScroll)*0.2;   // ease toward snap point
+  const cxCenter = CONFIG.W/2;
+  // clip region so cards don't bleed over the stats / buttons
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, CARD_Y-6, CONFIG.W, CARD_H+12); ctx.clip();
+  for(let i=0;i<CAROUSEL.length;i++){
+    const cardCx = cxCenter + i*stride - carScroll;
+    const x = Math.round(cardCx - CARD_W/2);
+    if(x > CONFIG.W+20 || x+CARD_W < -20) continue;  // offscreen cull
+    if(CAROUSEL[i]==='soon') drawComingSoonCard(x, CARD_Y, CARD_W, CARD_H);
+    else drawDragonCard(CAROUSEL[i], x, CARD_Y, CARD_W, CARD_H);
+  }
+  ctx.restore();
+  // left / right arrows
+  if(carIndex>0) arrowButton(20, CARD_Y+CARD_H/2, false, ()=>{ carIndex--; Audio_.click(); });
+  if(carIndex<CAROUSEL.length-1) arrowButton(CONFIG.W-20, CARD_Y+CARD_H/2, true, ()=>{ carIndex++; Audio_.click(); });
+  // dots
+  const dotY = CARD_Y+CARD_H+14, dn=CAROUSEL.length, dw=14;
+  for(let i=0;i<dn;i++){ ctx.fillStyle = i===carIndex?'#F5C518':'#3A2F55';
+    ctx.beginPath(); ctx.arc(cxCenter-(dn-1)*dw/2+i*dw, dotY, 3.5, 0, 7); ctx.fill(); }
+}
+function arrowButton(cx,cy,right,fn){
+  buttons.push({x:cx-18,y:cy-22,w:36,h:44,fn});
+  ctx.save();
+  ctx.fillStyle='rgba(20,12,40,0.7)'; ctx.beginPath(); ctx.arc(cx,cy,17,0,7); ctx.fill();
+  ctx.strokeStyle='#F5C518'; ctx.lineWidth=3; ctx.lineCap='round'; ctx.lineJoin='round';
+  const s=6, d=right?1:-1;
+  ctx.beginPath();
+  ctx.moveTo(cx-d*s*0.5, cy-s);
+  ctx.lineTo(cx+d*s*0.5, cy);
+  ctx.lineTo(cx-d*s*0.5, cy+s);
+  ctx.stroke();
+  ctx.restore();
+}
+function drawComingSoonCard(x,y,w,h){
+  ctx.fillStyle='#150D26'; roundRect(x,y,w,h,10); ctx.fill();
+  ctx.lineWidth=3; ctx.setLineDash([8,6]); ctx.strokeStyle='#3A2F55';
+  roundRect(x,y,w,h,10); ctx.stroke(); ctx.setLineDash([]);
+  // big question mark / egg motif
+  ctx.save();
+  ctx.translate(x+w/2, y+72);
+  ctx.fillStyle='#2A2040';
+  // simple pixel egg
+  for(let gy=-6;gy<=7;gy++) for(let gx=-5;gx<=5;gx++){
+    const rx=gx/5, ry=gy/7; if(rx*rx+ry*ry<=1){ ctx.fillRect(gx*5-2, gy*5-2, 5,5); }
+  }
+  ctx.fillStyle='#4A3A6A';
+  ctx.fillRect(-12, 4, 24, 4); ctx.fillRect(-8, 12, 16, 4);
+  ctx.restore();
+  text('???', x+w/2, y+150, '#6A5A8A', 14);
+  text('COMING SOON', x+w/2, y+182, '#8A7AB0', 9);
 }
 // --- environment selection (after dragon pick) ---
 function drawBiomePreview(b,x,y,w,h){
@@ -1575,7 +1771,10 @@ function drawGameOverName(){
   button('SAVE NAME', 30, CONFIG.H-66, CONFIG.W-60, 48, '#F5C518', '#000', ()=>{ Audio_.click(); commitName(); }, {fs:13,r:10});
   ctx.restore();
 }
-const KB_ROWS=['ABCDEFGHIJ','KLMNOPQRS','TUVWXYZ','0123456789'];
+const KB_ROWS=['QWERTYUIOP','ASDFGHJKL','ZXCVBNM','0123456789'];
+let kbFlash={};  // char -> timestamp(ms) of last press, for visual feedback
+function kbPress(ch){ kbFlash[ch]=performance.now(); }
+function kbLit(ch){ const t=kbFlash[ch]; return t && (performance.now()-t)<180; }
 function drawKeyboard(y){
   const kw=34, kh=34, gx=3;
   for(let r=0;r<KB_ROWS.length;r++){
@@ -1583,13 +1782,16 @@ function drawKeyboard(y){
     const totW=row.length*(kw+gx)-gx; let sx=(CONFIG.W-totW)/2;
     for(let i=0;i<row.length;i++){
       const ch=row[i], x=sx+i*(kw+gx), yy=y+r*(kh+gx);
-      button(ch, x, yy, kw, kh, '#221640', '#fff', ()=>{ if(nameEntry.length<8){ nameEntry+=ch; Audio_.type(); } }, {fs:11,r:6});
+      const lit=kbLit(ch);
+      button(ch, x, lit?yy+1:yy, kw, kh, lit?'#F5C518':'#221640', lit?'#1a1000':'#fff',
+        ()=>{ if(nameEntry.length<8){ nameEntry+=ch; kbPress(ch); Audio_.type(); } }, {fs:11,r:6});
     }
   }
   // backspace + space row
   const yy=y+4*(kh+gx);
-  button('DEL', 60, yy, 110, kh, '#3A1A2A', '#fff', ()=>{ nameEntry=nameEntry.slice(0,-1); Audio_.type(); }, {fs:10,r:6});
-  button('CLR', CONFIG.W-170, yy, 110, kh, '#3A1A2A', '#fff', ()=>{ nameEntry=''; Audio_.type(); }, {fs:10,r:6});
+  const delLit=kbLit('\b'), clrLit=kbLit('clr');
+  button('DEL', 60, yy, 110, kh, delLit?'#F5C518':'#3A1A2A', delLit?'#1a1000':'#fff', ()=>{ nameEntry=nameEntry.slice(0,-1); kbPress('\b'); Audio_.type(); }, {fs:10,r:6});
+  button('CLR', CONFIG.W-170, yy, 110, kh, clrLit?'#F5C518':'#3A1A2A', clrLit?'#1a1000':'#fff', ()=>{ nameEntry=''; kbPress('clr'); Audio_.type(); }, {fs:10,r:6});
 }
 
 let settingsReturn='select', settingsScroll=0, settingsView='main', devEntry='', devMsg='';
@@ -1698,10 +1900,12 @@ function drawDevKeyboard(y){
   for(let r=0;r<KB_ROWS.length;r++){
     const row=KB_ROWS[r], totW=row.length*(kw+gx)-gx; let sx=(CONFIG.W-totW)/2;
     for(let i=0;i<row.length;i++){ const ch=row[i], x=sx+i*(kw+gx), yy=y+r*(kh+gx);
-      button(ch, x, yy, kw, kh, '#221640', '#fff', ()=>{ if(devEntry.length<16){ devEntry+=ch; Audio_.type(); } }, {fs:11,r:6}); }
+      const lit=kbLit(ch);
+      button(ch, x, lit?yy+1:yy, kw, kh, lit?'#F5C518':'#221640', lit?'#1a1000':'#fff', ()=>{ if(devEntry.length<16){ devEntry+=ch; kbPress(ch); Audio_.type(); } }, {fs:11,r:6}); }
   }
   const yy=y+4*(kh+gx);
-  button('DEL', CONFIG.W/2-58, yy, 116, kh, '#3A1A2A', '#fff', ()=>{ devEntry=devEntry.slice(0,-1); Audio_.type(); }, {fs:10,r:6});
+  const delLit=kbLit('\b');
+  button('DEL', CONFIG.W/2-58, yy, 116, kh, delLit?'#F5C518':'#3A1A2A', delLit?'#1a1000':'#fff', ()=>{ devEntry=devEntry.slice(0,-1); kbPress('\b'); Audio_.type(); }, {fs:10,r:6});
 }
 function devSubmit(){
   if(devEntry.toLowerCase()==='dragondash'){
@@ -1716,6 +1920,7 @@ function playAgain(){ state='select'; }
 //  MAIN LOOP
 // ============================================================
 let TICK=0;
+let prevState=null;
 function frame(){
   TICK++;
   ctx.setTransform(RSCALE,0,0,RSCALE,0,0);
@@ -1741,6 +1946,15 @@ function frame(){
     else if(state==='settings') drawSettings();
     ctx.restore();
   }
+
+  // title-screen music: plays whenever the title is showing (and audio is ready/unmuted)
+  if(state==='select'){
+    if(prevState!=='select') carouselInit();
+    if(Audio_.ctx && !SAVE.muted && Audio_.ctx.state==='running') Audio_.startTitleMusic();
+  } else {
+    Audio_.stopTitleMusic();
+  }
+  prevState=state;
 
   requestAnimationFrame(frame);
 }
