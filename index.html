@@ -21,12 +21,15 @@
     touch-action:none; -webkit-user-select:none; user-select:none;
   }
   #wrap { position:relative; line-height:0; }
+  #sat { position:fixed; top:0; left:0; width:0;
+    height:constant(safe-area-inset-top); height:env(safe-area-inset-top); pointer-events:none; }
   canvas {
     display:block; background:#0D0618; touch-action:none;
   }
 </style>
 </head>
 <body>
+<div id="sat"></div>
 <div id="wrap"><canvas id="game" width="390" height="844"></canvas></div>
 <script>
 "use strict";
@@ -159,23 +162,30 @@ ctx.imageSmoothingEnabled = false;
 // VW = world width in play units (>=390; wider on desktop so the world extends past
 // the iPhone-sized column). OX = left offset of the centered 390-wide info column.
 // RSCALE = device-pixel scale so text & art render crisp at native resolution.
-let VW = 390, OX = 0, RSCALE = 1;
+let VW = 390, OX = 0, RSCALE = 1, SAFE_TOP = 0;
+const BASE_HUD = 54;
+const satProbe = document.getElementById('sat');
 function resize(){
   const cssW = window.innerWidth, cssH = window.innerHeight;
   const dpr = Math.max(1, Math.min(3, window.devicePixelRatio||1));
-  VW = Math.max(390, Math.min(2200, Math.round(CONFIG.H * cssW / cssH)));
+  const aspect = cssW/cssH;
+  // Portrait (phones / portrait tablets) => full iPhone-sized column, no side bars.
+  // Only extend into widescreen when the viewport is clearly landscape-ish.
+  if(aspect < 0.74){ VW = CONFIG.W; }
+  else { VW = Math.max(CONFIG.W, Math.min(2200, Math.round(CONFIG.H * aspect))); }
   OX = Math.round((VW - CONFIG.W) / 2);
-  // INTEGER device scale: every PX-grid fill lands on exact device pixels, so there are
-  // no sub-pixel seam lines and no shimmer/jitter while scrolling. ceil => supersample
-  // (sharp on non-integer-ratio displays). Clamp to keep the backing canvas reasonable.
+  // top safe-area inset (iPhone Dynamic Island / notch), converted to world units
+  const satCss = (satProbe && satProbe.offsetHeight) || 0;
+  SAFE_TOP = Math.max(0, Math.min(90, Math.round(satCss * CONFIG.H / cssH)));
+  CONFIG.HUD_H = BASE_HUD + SAFE_TOP;   // HUD bar grows to sit fully below the island
+  // INTEGER device scale so pixel-grid fills land on exact device pixels (no seams/jitter)
   RSCALE = Math.max(1, Math.ceil((cssH * dpr) / CONFIG.H));
   while(VW * RSCALE > 4400 && RSCALE > 1) RSCALE--;
   cv.width  = VW * RSCALE;
   cv.height = CONFIG.H * RSCALE;
-  // CSS scales the (crisp, integer) canvas to fill the viewport uniformly
   cv.style.width  = cssW + 'px';
   cv.style.height = cssH + 'px';
-  ctx.imageSmoothingEnabled = false; // reset (changing width clears context state)
+  ctx.imageSmoothingEnabled = false;
 }
 window.addEventListener('resize', resize); resize();
 
@@ -328,7 +338,7 @@ function startRun(startBiome){
   G.biome = startBiome; G.obstThisBiome = 0;
   SAVE.unlocked[startBiome]=true;
   G.nextBiomeAt = CONFIG.BIOME_LEN;  // transition every BIOME_LEN obstacles
-  G.graceTimer = 180;                // 3s breathing room before obstacles appear
+  G.countdown = 180; G.countdownLabel='GET READY';  // 3-2-1 freeze before play
   G.gapTighten = 0;        // cumulative px reduction
   G.slipstream = 0;        // +fraction gap
   G.transition = 0;        // 0..1 crossfade progress to next biome
@@ -407,6 +417,13 @@ function spawnPair(){
 // ============================================================
 function update(){
   G.frame++;
+  // start / resume countdown — freeze the world, just animate the flap
+  if(G.countdown>0){
+    G.countdown--;
+    G.flapTimer++; if(G.flapTimer>6){ G.flapTimer=0; G.flapFrame=(G.flapFrame+1)%3; }
+    updateParticles();
+    return;
+  }
   const sp = CONFIG.BASE_SPEED * G.mods.slowFactor *
              (G.timers.slowField>0?0.7:1) * (state==='playing'?1:0);
 
@@ -428,10 +445,9 @@ function update(){
   else if(G.y > botB){ G.y=botB; doDeath(); }
 
   // scroll obstacles
-  if(G.graceTimer>0) G.graceTimer--;
   G.distSinceObst += sp;
   G.bgScroll += sp;
-  if(G.distSinceObst >= CONFIG.OBST_SPACING && !G.pendingMilestone && G.graceTimer<=0){
+  if(G.distSinceObst >= CONFIG.OBST_SPACING && !G.pendingMilestone){
     spawnPair(); G.distSinceObst = 0;
   }
 
@@ -792,14 +808,24 @@ window.addEventListener('wheel', e=>{ if(state==='settings'){ settingsScroll+=e.
 window.addEventListener('keydown', e=>{
   if(e.code==='Space'){ e.preventDefault();
     if(state==='playing') jump();
+    else if(state==='paused') resumeGame();
     else if(state==='gameover'){ startRun(lastStartBiome); }
     else if(state==='select'){ state='envselect'; }
     else if(state==='envselect'){ startRun(0); }
+  }
+  if((e.code==='KeyP'||e.code==='Escape')){
+    if(state==='playing') pauseGame();
+    else if(state==='paused') resumeGame();
   }
   if(state==='gameover_name'){
     if(/^[a-zA-Z0-9]$/.test(e.key) && nameEntry.length<8){ nameEntry+=e.key.toUpperCase(); Audio_.type(); }
     else if(e.key==='Backspace'){ nameEntry=nameEntry.slice(0,-1); Audio_.type(); }
     else if(e.key==='Enter'){ commitName(); }
+  }
+  if(state==='settings' && settingsView==='dev'){
+    if(/^[a-zA-Z0-9]$/.test(e.key) && devEntry.length<16){ devEntry+=e.key.toUpperCase(); Audio_.type(); }
+    else if(e.key==='Backspace'){ devEntry=devEntry.slice(0,-1); Audio_.type(); }
+    else if(e.key==='Enter'){ devSubmit(); }
   }
 });
 
@@ -894,12 +920,7 @@ function drawWorld(){
   }
   ctx.globalAlpha=1;
 
-  // subtle edges marking the iPhone-sized play column on wide screens
-  if(OX>0){
-    ctx.fillStyle='rgba(0,0,0,0.18)';
-    ctx.fillRect(0,CONFIG.HUD_H,OX,CONFIG.H); ctx.fillRect(OX+CONFIG.W,CONFIG.HUD_H,VW-OX-CONFIG.W,CONFIG.H);
-  }
-  // full-width HUD bar
+  // full-width HUD bar (covers the iPhone island area too)
   ctx.fillStyle='rgba(13,6,24,0.9)'; ctx.fillRect(0,0,VW,CONFIG.HUD_H);
 
   // ===== centered play column =====
@@ -942,10 +963,10 @@ function drawWorld(){
 
   drawHUD();
   if(G.transition>0){ text('ENTERING '+BIOMES[G.transTarget].name, CONFIG.W/2, CONFIG.H/2, '#fff', 10); }
-  if(G.graceTimer>0 && !G.dead){
-    const secs=Math.ceil(G.graceTimer/60);
-    text('GET READY', CONFIG.W/2, CONFIG.H/2-30, '#F5C518', 16);
-    text(secs, CONFIG.W/2, CONFIG.H/2+14, '#fff', 28);
+  if(G.countdown>0 && !G.dead){
+    const secs=Math.ceil(G.countdown/60);
+    text(G.countdownLabel||'GET READY', CONFIG.W/2, CONFIG.H/2-30, '#F5C518', 16);
+    text(secs, CONFIG.W/2, CONFIG.H/2+16, '#fff', 30);
   }
   ctx.restore();
 
@@ -1211,32 +1232,85 @@ function star(cx,cy,r,n){
 }
 
 function drawHUD(){
-  // hearts (top-left)
-  let hx=8; const px=2.3;
-  for(let i=0;i<G.maxHearts;i++){ drawHeart(hx,8,px, '#E74C3C', i>=G.hearts); hx+=8*px+4; }
-  for(let i=0;i<G.tempHearts;i++){ drawHeart(hx,8,px,'#F5C518',false); hx+=8*px+4; }
+  const t=SAFE_TOP;
+  // hearts (top-left, below the island)
+  let hx=8; const ps=2.3;
+  for(let i=0;i<G.maxHearts;i++){ drawHeart(hx,t+8,ps, '#E74C3C', i>=G.hearts); hx+=8*ps+4; }
+  for(let i=0;i<G.tempHearts;i++){ drawHeart(hx,t+8,ps,'#F5C518',false); hx+=8*ps+4; }
   // score (center) + best (under it)
-  text('SCORE '+G.score, CONFIG.W/2, 18, '#fff', 11);
-  text('BEST '+SAVE.high, CONFIG.W/2, 40, '#888', 7);
-  // coins collected this run (top-right)
-  drawCoin(CONFIG.W-82, 16, 7, 'normal');
-  text(G.runCoins, CONFIG.W-70, 16, '#F5C518', 11, 'left');
-  text('THIS RUN', CONFIG.W-12, 40, '#777', 6, 'right');
-  // active timed powerup indicator
+  text('SCORE '+G.score, CONFIG.W/2, t+16, '#fff', 11);
+  text('BEST '+SAVE.high, CONFIG.W/2, t+38, '#888', 7);
+  // run coins (right, just left of the pause button)
+  drawCoin(CONFIG.W-98, t+14, 7, 'normal');
+  text(G.runCoins, CONFIG.W-86, t+14, '#F5C518', 10, 'left');
+  // pause button (far top-right)
+  if(!G.dead) pauseButton(CONFIG.W-22, t+18);
+  // active timed powerup indicators (below the bar)
   let iy=CONFIG.HUD_H+6, ix=CONFIG.W-70;
   const tlist=[['magnet',G.timers.magnet,15],['tiny',G.timers.tiny,20],['slowField',G.timers.slowField,12],['doublePoints',G.timers.doublePoints,20]];
-  for(const [name,t,max] of tlist){ if(t>0){
+  for(const [name,t2,max] of tlist){ if(t2>0){
     ctx.fillStyle='rgba(0,0,0,0.4)'; ctx.fillRect(ix,iy,64,8);
-    ctx.fillStyle='#5BC8F5'; ctx.fillRect(ix,iy,64*(t/(max*60)),8);
+    ctx.fillStyle='#5BC8F5'; ctx.fillRect(ix,iy,64*(t2/(max*60)),8);
     text(name.toUpperCase().slice(0,6),ix-4,iy+4,'#9FE',6,'right'); iy+=12;
   }}
+}
+function pauseButton(cx,cy){
+  buttons.push({x:cx-16,y:cy-16,w:32,h:32,fn:()=>pauseGame()});
+  ctx.fillStyle='rgba(0,0,0,0.4)'; roundRect(cx-15,cy-15,30,30,6); ctx.fill();
+  ctx.fillStyle='#e8e8f0'; ctx.fillRect(cx-7,cy-8,5,16); ctx.fillRect(cx+2,cy-8,5,16);
+}
+function pauseGame(){ if(state==='playing' && !G.dead){ state='paused'; Audio_.stopMusic(); } }
+function resumeGame(){ state='playing'; G.countdown=180; G.countdownLabel='RESUME'; Audio_.startMusic(); }
+function drawPaused(){
+  drawWorld();
+  ctx.fillStyle='rgba(5,2,12,0.74)'; ctx.fillRect(0,0,VW,CONFIG.H);
+  ctx.save(); ctx.translate(OX,0); buttons=[];
+  text('PAUSED', CONFIG.W/2, CONFIG.H/2-90, '#F5C518', 22);
+  button('RESUME', 50, CONFIG.H/2-30, CONFIG.W-100, 56, DRAGONS[SAVE.dragon].color, '#fff', ()=>{ Audio_.click(); resumeGame(); }, {fs:16,r:12});
+  button('MAIN MENU', 50, CONFIG.H/2+44, CONFIG.W-100, 48, '#3A1A5A', '#F5C518', ()=>{ Audio_.click(); Audio_.stopMusic(); state='select'; }, {fs:13,r:10});
+  ctx.restore();
 }
 
 // ============================================================
 //  RENDER: SCREENS
 // ============================================================
+let menuDragons=[], menuStars=null;
+function drawMenuBG(w){
+  // night sky
+  const g=ctx.createLinearGradient(0,0,0,CONFIG.H);
+  g.addColorStop(0,'#1b0e36'); g.addColorStop(0.45,'#27124c'); g.addColorStop(1,'#0b0820');
+  ctx.fillStyle=g; ctx.fillRect(0,0,w,CONFIG.H);
+  // stars
+  if(!menuStars){ menuStars=[]; for(let i=0;i<70;i++) menuStars.push({x:Math.random(),y:Math.random()*0.5,p:Math.random()*6.28,s:Math.random()<0.25?2:1}); }
+  for(const s of menuStars){ const tw=0.5+0.5*Math.sin(TICK*0.05+s.p); ctx.globalAlpha=0.25+0.6*tw; ctx.fillStyle='#fff'; ctx.fillRect(Math.round(s.x*w),Math.round(s.y*CONFIG.H),s.s,s.s); }
+  ctx.globalAlpha=1;
+  // moon (crescent)
+  ctx.fillStyle='#efe8ff'; ctx.beginPath(); ctx.arc(w*0.78, CONFIG.H*0.15, 24,0,7); ctx.fill();
+  ctx.fillStyle='#27124c'; ctx.beginPath(); ctx.arc(w*0.78+9, CONFIG.H*0.15-6, 21,0,7); ctx.fill();
+  // parallax pixel hills
+  menuHills(w,'#241a44', 0.18, 150, 7);
+  menuHills(w,'#33245e', 0.42, 95, 13);
+  menuHills(w,'#0f0a26', 0.0, 46, 0);   // foreground floor
+  // flying dragons (behind UI)
+  if(menuDragons.length<2 && Math.random()<0.02){
+    menuDragons.push({ key:Math.random()<0.5?'fire':'ice', x:-70, y:CONFIG.H*0.12+Math.random()*CONFIG.H*0.2, sp:1.1+Math.random()*1.4, scale:0.9+Math.random()*0.7, f:0, ft:0 });
+  }
+  for(const d of menuDragons){ d.x+=d.sp; d.ft++; if(d.ft>7){ d.ft=0; d.f=(d.f+1)%3; }
+    const s=SPRITES[d.key]; if(s&&s.ready){ const dw=CONFIG.DRAGON_DRAW_W*d.scale, dh=dw*(s.fh/s.fw);
+      ctx.globalAlpha=0.92; ctx.drawImage(s.img, d.f*s.fw,0,s.fw,s.fh, Math.round(d.x-dw/2), Math.round(d.y-dh/2), dw,dh); ctx.globalAlpha=1; } }
+  menuDragons=menuDragons.filter(d=>d.x<w+90);
+}
+function menuHills(w,color,speed,amp,seed){
+  ctx.fillStyle=color;
+  const off=TICK*speed;
+  for(let x=0;x<w;x+=4){
+    const hh = amp*0.5 + Math.sin((x+off)*0.012+seed)*amp*0.3 + Math.sin((x+off*1.7)*0.03+seed)*amp*0.18;
+    ctx.fillRect(x, CONFIG.H-hh, 4, hh+4);
+  }
+}
 function drawSelect(){
   buttons=[];
+  ctx.save(); ctx.translate(-OX,0); drawMenuBG(VW); ctx.restore();   // full-width animated bg
   text('DRAGON DASH', CONFIG.W/2, 90, '#F5C518', 20);
   // stats row
   drawCoin(40,140,9,'normal'); text(SAVE.coins, 56, 140, '#F5C518', 12, 'left');
@@ -1258,7 +1332,7 @@ function drawSelect(){
   G.dragon=DRAGONS[SAVE.dragon];
   drawDragonSprite(CONFIG.W/2, 720, 1.6, Math.floor(performance.now()/130)%3, 0, 1, null);
   // settings gear (top-right of the column)
-  gearButton(CONFIG.W-34, 34, ()=>{ Audio_.click(); settingsReturn='select'; settingsScroll=0; state='settings'; });
+  gearButton(CONFIG.W-34, SAFE_TOP+30, ()=>{ Audio_.click(); settingsReturn='select'; settingsView='main'; settingsScroll=0; state='settings'; });
 }
 // --- environment selection (after dragon pick) ---
 function drawBiomePreview(b,x,y,w,h){
@@ -1266,23 +1340,49 @@ function drawBiomePreview(b,x,y,w,h){
   roundRect(x,y,w,h,6); ctx.clip();
   const g=ctx.createLinearGradient(0,y,0,y+h); g.addColorStop(0,b.bgTop); g.addColorStop(1,b.bgBot);
   ctx.fillStyle=g; ctx.fillRect(x,y,w,h);
-  ctx.fillStyle=b.silNear; ctx.fillRect(x,y+h-5,w,5);              // ground
-  for(let i=0;i<2;i++){
-    const fx=Math.round(x+14+i*(w-22));
-    ctx.fillStyle=b.oMid;   ctx.fillRect(fx, y+h-5-13, 8, 13);     // stalagmite
-    ctx.fillStyle=b.oLight; ctx.fillRect(fx, y+h-5-13, 2, 13);
-    ctx.fillStyle=b.oMid;   ctx.fillRect(fx+1, y, 6, 11);          // stalactite
+  // distant ridge
+  ctx.fillStyle=b.silFar;
+  for(let i=0;i<w;i+=4){ const hh=5+(Math.sin(i*0.5+b.name.length)+1)*4; ctx.fillRect(x+i, y+h-10-hh, 4, hh+10); }
+  ctx.fillStyle=b.silNear; ctx.fillRect(x,y+h-8,w,8);   // ground
+  const gy=y+h-8;
+  if(b.tip==='spike'){                 // cave: stalactites + stalagmites
+    for(let i=0;i<3;i++){ const fx=Math.round(x+14+i*((w-22)/2));
+      for(let k=0;k<4;k++){ const ww=9-k*2; ctx.fillStyle=k?b.oMid:b.oLight; ctx.fillRect(fx-((ww/2)|0), y+k*4, ww,4); }
+      for(let k=0;k<4;k++){ const ww=9-k*2; ctx.fillStyle=b.oMid; ctx.fillRect(fx-((ww/2)|0), gy-(k+1)*4, ww,4); ctx.fillStyle=b.oLight; ctx.fillRect(fx-((ww/2)|0), gy-(k+1)*4,2,4); } }
+  } else if(b.tip==='forest'){         // trees + glowing mushrooms
+    for(let i=0;i<2;i++){ const fx=Math.round(x+26+i*(w-52));
+      ctx.fillStyle=b.oDark; ctx.fillRect(fx-2, gy-22, 5, 22);
+      ctx.fillStyle=b.oMid;  ctx.fillRect(fx-11, gy-36, 24, 16);
+      ctx.fillStyle=b.oLight;ctx.fillRect(fx-11, gy-36, 24, 4); }
+    ctx.fillStyle=b.accent; for(let i=0;i<3;i++){ const mx=x+12+i*((w-18)/2); ctx.fillRect(mx, gy-6,6,5); ctx.fillRect(mx+1, gy-2,4,2); }
+  } else if(b.tip==='ice'){            // crystals + sparkle
+    for(let i=0;i<4;i++){ const fx=Math.round(x+13+i*((w-20)/3));
+      for(let k=0;k<5;k++){ const ww=Math.max(1,9-k*2); ctx.fillStyle=k%2?b.oMid:b.oLight; ctx.fillRect(fx-((ww/2)|0), gy-(k+1)*4, ww,4); } }
+    ctx.fillStyle=b.acc2; for(let i=0;i<5;i++) ctx.fillRect(x+8+i*16, y+8+(i%3)*6, 2,2);
+  } else if(b.tip==='ruins'){          // broken pillars
+    for(let i=0;i<3;i++){ const fx=Math.round(x+18+i*((w-30)/2));
+      ctx.fillStyle=b.oMid;   ctx.fillRect(fx-5, gy-26, 12, 26);
+      ctx.fillStyle=b.oLight; ctx.fillRect(fx-5, gy-26, 3, 26);
+      ctx.fillStyle=b.accent; ctx.fillRect(fx-6, gy-28, 14, 3); }
+  } else {                             // lava: spires + molten pool
+    const lg=ctx.createLinearGradient(0,gy-3,0,y+h); lg.addColorStop(0,b.accent); lg.addColorStop(1,b.acc2);
+    ctx.fillStyle=lg; ctx.fillRect(x,gy-2,w,h);
+    for(let i=0;i<3;i++){ const fx=Math.round(x+18+i*((w-30)/2));
+      for(let k=0;k<5;k++){ const ww=Math.max(2,11-k*2); ctx.fillStyle=b.oMid; ctx.fillRect(fx-((ww/2)|0), y+6+k*4, ww,4); }
+      ctx.fillStyle=b.accent; ctx.fillRect(fx-1, y+6, 2, 9); }
+    ctx.fillStyle=b.acc2; for(let i=0;i<4;i++) ctx.fillRect(x+10+i*20, y+6+(i%2)*4, 2,2);
   }
   ctx.restore();
   ctx.strokeStyle='#2A2040'; ctx.lineWidth=2; roundRect(x,y,w,h,6); ctx.stroke();
 }
 function drawEnvSelect(){
   buttons=[];
-  text('CHOOSE START', CONFIG.W/2, 48, '#F5C518', 16);
+  const T=SAFE_TOP;
+  text('CHOOSE START', CONFIG.W/2, T+40, '#F5C518', 16);
   const d=DRAGONS[SAVE.dragon];
-  button('FULL JOURNEY', 44, 72, CONFIG.W-88, 50, d.color, '#fff', ()=>{ Audio_.click(); startRun(0); }, {fs:14,r:12});
-  text('PLAY ALL AREAS IN ORDER', CONFIG.W/2, 134, '#777', 6);
-  let y=152; const cardH=84;
+  button('FULL JOURNEY', 44, T+62, CONFIG.W-88, 50, d.color, '#fff', ()=>{ Audio_.click(); startRun(0); }, {fs:14,r:12});
+  text('PLAY ALL AREAS IN ORDER', CONFIG.W/2, T+124, '#777', 6);
+  let y=T+142; const cardH=84;
   for(let i=0;i<BIOMES.length;i++){
     const b=BIOMES[i], unlocked=!!SAVE.unlocked[i];
     ctx.globalAlpha = unlocked?1:0.5;
@@ -1297,7 +1397,7 @@ function drawEnvSelect(){
     y+=cardH+8;
   }
   button('BACK', 30, CONFIG.H-66, CONFIG.W-60, 48, '#3A1A5A', '#F5C518', ()=>{ Audio_.click(); state='select'; }, {fs:14,r:10});
-  gearButton(CONFIG.W-30, 30, ()=>{ Audio_.click(); settingsReturn='envselect'; settingsScroll=0; state='settings'; });
+  gearButton(CONFIG.W-30, T+28, ()=>{ Audio_.click(); settingsReturn='envselect'; settingsView='main'; settingsScroll=0; state='settings'; });
 }
 function drawDragonCard(key,x,y,w,h){
   const d=DRAGONS[key]; const sel=SAVE.dragon===key;
@@ -1327,29 +1427,28 @@ function wrapText(str,cx,y,maxw,lh,color,fs){
 let shopScroll=0;
 function drawShop(){
   buttons=[];
-  text('SHOP', 20, 40, '#F5C518', 16, 'left');
-  drawCoin(CONFIG.W-90,40,9,'normal'); text(SAVE.coins,CONFIG.W-74,40,'#F5C518',12,'left');
-  let y=80;
+  const top=SAFE_TOP;
+  text('SHOP', 20, top+30, '#F5C518', 16, 'left');
+  drawCoin(CONFIG.W-92,top+30,9,'normal'); text(SAVE.coins,CONFIG.W-76,top+30,'#F5C518',12,'left');
+  let y=top+58; const cardH=78;
   for(const u of UPGRADES){
     const lvl=upLvl(u.id), maxed=lvl>=u.max, afford=SAVE.coins>=u.cost && !maxed;
-    const cardH=86;
     ctx.fillStyle='#1A1030'; ctx.globalAlpha=maxed?0.6:1; roundRect(20,y,CONFIG.W-40,cardH,10); ctx.fill(); ctx.globalAlpha=1;
     ctx.lineWidth=2; ctx.strokeStyle=maxed?'#3A6A3A':(afford?'#F5C518':'#2A2040'); roundRect(20,y,CONFIG.W-40,cardH,10); ctx.stroke();
-    text(u.name, 34, y+18, '#fff', 9, 'left');
-    wrapTextLeft(u.desc, 34, y+38, CONFIG.W-150, 12, '#888', 7);
-    text('LV '+lvl+'/'+u.max, 34, y+cardH-14, '#aaa', 7, 'left');
+    text(u.name, 34, y+16, '#fff', 9, 'left');
+    wrapTextLeft(u.desc, 34, y+34, CONFIG.W-150, 12, '#888', 7);
+    text('LV '+lvl+'/'+u.max, 34, y+cardH-12, '#aaa', 7, 'left');
     if(maxed){ text('MAXED', CONFIG.W-50, y+cardH/2, '#3CB371', 9, 'right'); }
     else {
-      const bw=78,bh=34,bx=CONFIG.W-40-bw-6,by=y+cardH/2-bh/2;
+      const bw=78,bh=32,bx=CONFIG.W-40-bw-6,by=y+cardH/2-bh/2;
       const bg2=afford?'#F5C518':'#332', fg=afford?'#000':'#777';
       if(afford){ button(u.cost+'🪙', bx,by,bw,bh, bg2, fg, ()=>buy(u), {fs:9,r:8}); }
       else { ctx.fillStyle=bg2; roundRect(bx,by,bw,bh,8); ctx.fill(); text(u.cost+'🪙',bx+bw/2,by+bh/2,fg,9);
              buttons.push({x:bx,y:by,w:bw,h:bh,fn:()=>{Audio_.buzz();}}); }
     }
-    y+=cardH+12;
+    y+=cardH+10;
   }
-  // back
-  button('BACK', 30, CONFIG.H-70, CONFIG.W-60, 48, '#3A1A5A', '#F5C518', ()=>{ Audio_.click(); state='select'; }, {fs:14,r:10});
+  button('BACK', 30, CONFIG.H-66, CONFIG.W-60, 46, '#3A1A5A', '#F5C518', ()=>{ Audio_.click(); state='select'; }, {fs:14,r:10});
 }
 function wrapTextLeft(str,x,y,maxw,lh,color,fs){
   setFont(fs); ctx.fillStyle=color; ctx.textAlign='left'; ctx.textBaseline='middle';
@@ -1404,7 +1503,7 @@ function drawGameOver(){
   button('SHOP', 30, 712, (CONFIG.W-72)/2, 48, '#3A1A5A', '#F5C518', ()=>{ Audio_.click(); shopScroll=0; state='shop'; }, {fs:13,r:10});
   button('MAIN MENU', 30+(CONFIG.W-72)/2+12, 712, (CONFIG.W-72)/2, 48, '#2A1640', '#cbd', ()=>{ Audio_.click(); state='select'; }, {fs:11,r:10});
   // settings gear (top-right)
-  gearButton(CONFIG.W-30, 34, ()=>{ Audio_.click(); settingsReturn='gameover'; settingsScroll=0; state='settings'; });
+  gearButton(CONFIG.W-30, SAFE_TOP+30, ()=>{ Audio_.click(); settingsReturn='gameover'; settingsView='main'; settingsScroll=0; state='settings'; });
   ctx.restore();
 }
 function scoreCard(label,val,x,y,w,h,col){
@@ -1493,7 +1592,7 @@ function drawKeyboard(y){
   button('CLR', CONFIG.W-170, yy, 110, kh, '#3A1A2A', '#fff', ()=>{ nameEntry=''; Audio_.type(); }, {fs:10,r:6});
 }
 
-let settingsReturn='select', settingsScroll=0;
+let settingsReturn='select', settingsScroll=0, settingsView='main', devEntry='', devMsg='';
 const POWERUP_GUIDE=[
   ['shield','SHIELD','Absorbs one hit'],
   ['magnet','MAGNET','Auto-collects nearby coins for 15s'],
@@ -1514,25 +1613,34 @@ function gearButton(cx,cy,fn){
 }
 function drawSettings(){
   buttons=[];
-  text('SETTINGS', CONFIG.W/2, 40, '#F5C518', 16);
-  // sound toggle (fixed)
-  const yt=62;
-  ctx.fillStyle='#160E2A'; roundRect(24,yt,CONFIG.W-48,42,10); ctx.fill();
-  ctx.lineWidth=2; ctx.strokeStyle='#2A2040'; roundRect(24,yt,CONFIG.W-48,42,10); ctx.stroke();
-  text('SOUND', 42, yt+21, '#fff', 10, 'left');
+  const T=SAFE_TOP;
+  if(settingsView==='encyclopedia'){ drawEncyclopedia(T); return; }
+  if(settingsView==='reset'){ drawResetMenu(T); return; }
+  if(settingsView==='dev'){ drawDevMenu(T); return; }
+  // ---- main settings ----
+  text('SETTINGS', CONFIG.W/2, T+40, '#F5C518', 16);
+  let y=T+70;
+  ctx.fillStyle='#160E2A'; roundRect(24,y,CONFIG.W-48,46,10); ctx.fill();
+  ctx.lineWidth=2; ctx.strokeStyle='#2A2040'; roundRect(24,y,CONFIG.W-48,46,10); ctx.stroke();
+  text('SOUND', 42, y+23, '#fff', 10, 'left');
   const on=!SAVE.muted;
-  button(on?'ON':'OFF', CONFIG.W-40-74, yt+6, 74, 30, on?'#2ECC71':'#4a3a3a', on?'#06210f':'#cbb', ()=>{ SAVE.muted=!SAVE.muted; Audio_.setMute(SAVE.muted); saveAll(); Audio_.click(); }, {fs:10,r:8});
-
-  const viewTop=118, viewBot=CONFIG.H-66, viewH=viewBot-viewTop;
-  // total scrollable content height
-  let ch=24 + POWERUP_GUIDE.length*(66+10) + 44 + BUFFS.length*(60+8);
+  button(on?'ON':'OFF', CONFIG.W-40-74, y+8, 74, 30, on?'#2ECC71':'#4a3a3a', on?'#06210f':'#cbb', ()=>{ SAVE.muted=!SAVE.muted; Audio_.setMute(SAVE.muted); saveAll(); Audio_.click(); }, {fs:10,r:8});
+  y+=62;
+  button('ENCYCLOPEDIA', 24, y, CONFIG.W-48, 50, '#23304f', '#bfe0ef', ()=>{ Audio_.click(); settingsView='encyclopedia'; settingsScroll=0; }, {fs:13,r:10}); y+=60;
+  button('RESET PROGRESS', 24, y, CONFIG.W-48, 50, '#4a1f2a', '#ffb3b3', ()=>{ Audio_.click(); settingsView='reset'; }, {fs:13,r:10}); y+=60;
+  button('DEVELOPER ACCESS', 24, y, CONFIG.W-48, 50, '#2a2340', '#cdbff2', ()=>{ Audio_.click(); settingsView='dev'; devEntry=''; devMsg=''; }, {fs:12,r:10}); y+=60;
+  button('BACK', 30, CONFIG.H-66, CONFIG.W-60, 48, '#3A1A5A', '#F5C518', ()=>{ Audio_.click(); state=settingsReturn||'select'; }, {fs:14,r:10});
+}
+function drawEncyclopedia(T){
+  text('ENCYCLOPEDIA', CONFIG.W/2, T+38, '#F5C518', 15);
+  const viewTop=T+60, viewBot=CONFIG.H-64, viewH=viewBot-viewTop;
+  const ch=24 + POWERUP_GUIDE.length*(66+10) + 44 + BUFFS.length*(60+8);
   const maxScroll=Math.max(0, ch-viewH);
   settingsScroll = Math.max(0, Math.min(maxScroll, settingsScroll));
-
   ctx.save();
   roundRect(18,viewTop-4,CONFIG.W-36,viewH+8,10); ctx.clip();
   let y=viewTop - settingsScroll;
-  text('POWER-UP GUIDE', CONFIG.W/2, y+8, '#5BC8F5', 10); y+=24;
+  text('POWER-UPS', CONFIG.W/2, y+8, '#5BC8F5', 10); y+=24;
   for(const [type,name,desc] of POWERUP_GUIDE){
     const h=66;
     ctx.fillStyle='#140C26'; roundRect(24,y,CONFIG.W-48,h,10); ctx.fill();
@@ -1555,14 +1663,51 @@ function drawSettings(){
     y+=h+8;
   }
   ctx.restore();
-
-  // scrollbar
   if(maxScroll>0){
     const th=Math.max(26, viewH*viewH/ch), ty=viewTop + (viewH-th)*(settingsScroll/maxScroll);
     ctx.fillStyle='rgba(255,255,255,0.08)'; roundRect(CONFIG.W-13,viewTop,4,viewH,2); ctx.fill();
     ctx.fillStyle='rgba(245,197,24,0.55)'; roundRect(CONFIG.W-13,ty,4,th,2); ctx.fill();
   }
-  button('BACK', 30, CONFIG.H-56, CONFIG.W-60, 44, '#3A1A5A', '#F5C518', ()=>{ Audio_.click(); state=settingsReturn||'select'; }, {fs:14,r:10});
+  button('BACK', 30, CONFIG.H-56, CONFIG.W-60, 44, '#3A1A5A', '#F5C518', ()=>{ Audio_.click(); settingsView='main'; settingsScroll=0; }, {fs:14,r:10});
+}
+function drawResetMenu(T){
+  text('RESET PROGRESS', CONFIG.W/2, T+56, '#E0563B', 15);
+  wrapText('This erases your coins, upgrades, best scores, leaderboard and unlocked areas. This cannot be undone.', CONFIG.W/2, T+104, CONFIG.W-90, 18, '#bbb', 8);
+  button('CONFIRM RESET', 40, CONFIG.H/2, CONFIG.W-80, 56, '#C0392B', '#fff', ()=>{ Audio_.click(); doResetProgress(); }, {fs:14,r:12});
+  button('CANCEL', 40, CONFIG.H/2+72, CONFIG.W-80, 48, '#3A1A5A', '#F5C518', ()=>{ Audio_.click(); settingsView='main'; }, {fs:13,r:10});
+}
+function doResetProgress(){
+  SAVE.coins=0; SAVE.high=0; SAVE.board=[]; SAVE.upgrades={};
+  SAVE.unlocked=[true,false,false,false,false]; saveAll();
+  Audio_.buzz(); settingsView='main';
+}
+function drawDevMenu(T){
+  text('DEVELOPER ACCESS', CONFIG.W/2, T+40, '#F5C518', 14);
+  text('ENTER PASSWORD', CONFIG.W/2, T+66, '#888', 8);
+  const bx=40, bw=CONFIG.W-80, by=T+82;
+  ctx.fillStyle='#160E2A'; roundRect(bx,by,bw,40,8); ctx.fill();
+  ctx.lineWidth=2; ctx.strokeStyle='#2A2040'; roundRect(bx,by,bw,40,8); ctx.stroke();
+  text(devEntry?('*'.repeat(devEntry.length)):'_', CONFIG.W/2, by+20, '#fff', 12);
+  if(devMsg) text(devMsg, CONFIG.W/2, by+56, devMsg==='UNLOCKED!'?'#3CB371':'#E0563B', 9);
+  drawDevKeyboard(T+158);
+  button('SUBMIT', 40, CONFIG.H-116, CONFIG.W-80, 44, '#2ECC71', '#06210f', ()=>{ devSubmit(); }, {fs:13,r:10});
+  button('BACK', 40, CONFIG.H-64, CONFIG.W-80, 44, '#3A1A5A', '#F5C518', ()=>{ Audio_.click(); settingsView='main'; }, {fs:14,r:10});
+}
+function drawDevKeyboard(y){
+  const kw=34, kh=30, gx=3;
+  for(let r=0;r<KB_ROWS.length;r++){
+    const row=KB_ROWS[r], totW=row.length*(kw+gx)-gx; let sx=(CONFIG.W-totW)/2;
+    for(let i=0;i<row.length;i++){ const ch=row[i], x=sx+i*(kw+gx), yy=y+r*(kh+gx);
+      button(ch, x, yy, kw, kh, '#221640', '#fff', ()=>{ if(devEntry.length<16){ devEntry+=ch; Audio_.type(); } }, {fs:11,r:6}); }
+  }
+  const yy=y+4*(kh+gx);
+  button('DEL', CONFIG.W/2-58, yy, 116, kh, '#3A1A2A', '#fff', ()=>{ devEntry=devEntry.slice(0,-1); Audio_.type(); }, {fs:10,r:6});
+}
+function devSubmit(){
+  if(devEntry.toLowerCase()==='dragondash'){
+    SAVE.unlocked=[true,true,true,true,true]; SAVE.coins=Math.max(SAVE.coins,999); saveAll();
+    devMsg='UNLOCKED!'; Audio_.purchase();
+  } else { devMsg='WRONG PASSWORD'; Audio_.buzz(); }
 }
 
 function playAgain(){ state='select'; }
@@ -1570,7 +1715,9 @@ function playAgain(){ state='select'; }
 // ============================================================
 //  MAIN LOOP
 // ============================================================
+let TICK=0;
 function frame(){
+  TICK++;
   ctx.setTransform(RSCALE,0,0,RSCALE,0,0);
   // screen shake (gameplay only — never on game-over / menu overlays)
   if(shake>0.5 && state==='playing'){
@@ -1579,6 +1726,7 @@ function frame(){
   ctx.clearRect(-60,-60,VW+120,CONFIG.H+120);
 
   if(state==='playing'){ tickInvuln(); update(); drawWorld(); }
+  else if(state==='paused'){ drawPaused(); }
   else if(state==='milestone'){ drawMilestone(); }
   else if(state==='gameover'){ drawGameOver(); }
   else if(state==='gameover_name'){ drawGameOverName(); }
