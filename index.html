@@ -64,7 +64,8 @@ const LS = {
   board:'dragonDash_leaderboard',
   up:'dragonDash_upgrades',
   dragon:'dragonDash_dragon',
-  muted:'dragonDash_muted'
+  muted:'dragonDash_muted',
+  unlocked:'dragonDash_unlockedBiomes'
 };
 function loadNum(k,d){ const v=parseInt(localStorage.getItem(k)); return isNaN(v)?d:v; }
 function loadJSON(k,d){ try{ const v=JSON.parse(localStorage.getItem(k)); return v||d; }catch(e){ return d; } }
@@ -75,8 +76,15 @@ let SAVE = {
   board: loadJSON(LS.board, []),
   upgrades: loadJSON(LS.up, {}),
   dragon: localStorage.getItem(LS.dragon) || 'fire',
-  muted: localStorage.getItem(LS.muted)==='1'
+  muted: localStorage.getItem(LS.muted)==='1',
+  unlocked: loadJSON(LS.unlocked, [true,false,false,false,false])
 };
+function normalizeUnlocked(){
+  if(!Array.isArray(SAVE.unlocked)) SAVE.unlocked=[true,false,false,false,false];
+  while(SAVE.unlocked.length<5) SAVE.unlocked.push(false);
+  SAVE.unlocked[0]=true;
+}
+normalizeUnlocked();
 function saveAll(){
   localStorage.setItem(LS.coins, SAVE.coins);
   localStorage.setItem(LS.high, SAVE.high);
@@ -84,6 +92,7 @@ function saveAll(){
   localStorage.setItem(LS.up, JSON.stringify(SAVE.upgrades));
   localStorage.setItem(LS.dragon, SAVE.dragon);
   localStorage.setItem(LS.muted, SAVE.muted?'1':'0');
+  localStorage.setItem(LS.unlocked, JSON.stringify(SAVE.unlocked));
 }
 
 // ---- Upgrades definition ----
@@ -154,16 +163,18 @@ let VW = 390, OX = 0, RSCALE = 1;
 function resize(){
   const cssW = window.innerWidth, cssH = window.innerHeight;
   const dpr = Math.max(1, Math.min(3, window.devicePixelRatio||1));
-  VW = Math.max(390, Math.min(2400, Math.round(CONFIG.H * cssW / cssH)));
+  VW = Math.max(390, Math.min(2200, Math.round(CONFIG.H * cssW / cssH)));
   OX = Math.round((VW - CONFIG.W) / 2);
-  RSCALE = (cssH * dpr) / CONFIG.H;
-  cv.width  = Math.round(VW * RSCALE);
-  cv.height = Math.round(CONFIG.H * RSCALE);
-  // fit display into the viewport (contain); usually fills exactly on phones & widescreen
-  let dw = cv.width/dpr, dh = cv.height/dpr;
-  const s = Math.min(cssW/dw, cssH/dh);
-  cv.style.width  = Math.round(dw*s)+'px';
-  cv.style.height = Math.round(dh*s)+'px';
+  // INTEGER device scale: every PX-grid fill lands on exact device pixels, so there are
+  // no sub-pixel seam lines and no shimmer/jitter while scrolling. ceil => supersample
+  // (sharp on non-integer-ratio displays). Clamp to keep the backing canvas reasonable.
+  RSCALE = Math.max(1, Math.ceil((cssH * dpr) / CONFIG.H));
+  while(VW * RSCALE > 4400 && RSCALE > 1) RSCALE--;
+  cv.width  = VW * RSCALE;
+  cv.height = CONFIG.H * RSCALE;
+  // CSS scales the (crisp, integer) canvas to fill the viewport uniformly
+  cv.style.width  = cssW + 'px';
+  cv.style.height = cssH + 'px';
   ctx.imageSmoothingEnabled = false; // reset (changing width clears context state)
 }
 window.addEventListener('resize', resize); resize();
@@ -299,7 +310,10 @@ function maxHearts(){ return 1 + upLvl('extraHeart'); }     // 1..3
 // ============================================================
 //  START A RUN
 // ============================================================
-function startRun(){
+let lastStartBiome = 0;
+function startRun(startBiome){
+  startBiome = startBiome|0; if(startBiome<0||startBiome>=BIOMES.length) startBiome=0;
+  lastStartBiome = startBiome;
   Audio_.init(); Audio_.resume();
   const mh = maxHearts();
   G.dragon = DRAGONS[SAVE.dragon];
@@ -311,7 +325,8 @@ function startRun(){
   G.obstacles = []; G.coins = []; G.powerups = [];
   G.distSinceObst = CONFIG.OBST_SPACING; // spawn soon
   G.scroll = 0; G.bgScroll = 0;
-  G.biome = 0; G.obstThisBiome = 0;
+  G.biome = startBiome; G.obstThisBiome = 0;
+  SAVE.unlocked[startBiome]=true;
   G.nextBiomeAt = CONFIG.BIOME_LEN;  // transition every BIOME_LEN obstacles
   G.graceTimer = 180;                // 3s breathing room before obstacles appear
   G.gapTighten = 0;        // cumulative px reduction
@@ -336,7 +351,8 @@ function startRun(){
   G.cursedCounter = 0;
   // ability counters tracked via G.streak
   particlesBG = []; fxParticles = []; shake=0; flash=0;
-  Audio_.setBiome(0); Audio_.startMusic();
+  Audio_.setBiome(startBiome); Audio_.startMusic();
+  saveAll();
   state = 'playing';
 }
 
@@ -481,6 +497,7 @@ function update(){
     G.transition += 0.012;
     if(G.transition>=1){
       G.transition=1; G.biome=G.transTarget; Audio_.setBiome(G.biome);
+      if(!SAVE.unlocked[G.biome]){ SAVE.unlocked[G.biome]=true; saveAll(); }
       G.gapTighten += CONFIG.GAP_STEP;
       G.biomeMods = { phantomWings:false, goldRush:false };
       G.transition=0;
@@ -743,20 +760,41 @@ function hitTest(p){
   }
   return false;
 }
+let dragActive=false, dragLastY=0, dragMoved=0;
 function onPointerDown(e){
   e.preventDefault();
   Audio_.init(); Audio_.resume();
   const p=canvasPos(e); pointer=p;
+  if(state==='settings'){ dragActive=true; dragLastY=p.y; dragMoved=0; }
   if(state==='playing'){ if(!hitTest(p)) jump(); return; }
+  if(state==='settings'){ pendingTap=p; return; }  // decide tap vs drag on release
   hitTest(p);
 }
+function onPointerMove(e){
+  if(!dragActive || state!=='settings') return;
+  const cy=(e.touches?e.touches[0].clientY:e.clientY);
+  const r=cv.getBoundingClientRect(); const wy=(cy-r.top)*(CONFIG.H/r.height);
+  const dy=dragLastY-wy; settingsScroll+=dy; dragLastY=wy; dragMoved+=Math.abs(dy);
+  e.preventDefault();
+}
+function onPointerUp(){
+  if(state==='settings' && pendingTap && dragMoved<6){ hitTest(pendingTap); }
+  pendingTap=null; dragActive=false;
+}
+let pendingTap=null;
 cv.addEventListener('mousedown', onPointerDown);
 cv.addEventListener('touchstart', onPointerDown, {passive:false});
+window.addEventListener('mousemove', onPointerMove);
+window.addEventListener('touchmove', onPointerMove, {passive:false});
+window.addEventListener('mouseup', onPointerUp);
+window.addEventListener('touchend', onPointerUp);
+window.addEventListener('wheel', e=>{ if(state==='settings'){ settingsScroll+=e.deltaY; } }, {passive:true});
 window.addEventListener('keydown', e=>{
   if(e.code==='Space'){ e.preventDefault();
     if(state==='playing') jump();
-    else if(state==='gameover'){ startRun(); }
-    else if(state==='select'){ startRun(); }
+    else if(state==='gameover'){ startRun(lastStartBiome); }
+    else if(state==='select'){ state='envselect'; }
+    else if(state==='envselect'){ startRun(0); }
   }
   if(state==='gameover_name'){
     if(/^[a-zA-Z0-9]$/.test(e.key) && nameEntry.length<8){ nameEntry+=e.key.toUpperCase(); Audio_.type(); }
@@ -893,10 +931,7 @@ function drawWorld(){
     ctx.strokeStyle='#FF6B1A'; ctx.globalAlpha=0.5+0.3*Math.sin(G.frame*0.4); ctx.lineWidth=3;
     ctx.beginPath(); ctx.arc(G.x,G.y,30*scale,0,7); ctx.stroke(); ctx.globalAlpha=1;
   }
-  // streak indicator (ability)
-  if(state==='playing' && !G.dead && G.streak>0){
-    text((SAVE.dragon==='fire'?'★':'❄')+(G.streak%15), G.x, G.y-30*scale, G.dragon.color, 7);
-  }
+  // (streak number above the dragon removed — was distracting)
   // fx particles
   for(const p of fxParticles){
     ctx.globalAlpha=Math.max(0,p.life);
@@ -985,7 +1020,7 @@ function drawObstacle(o,b){
     drawCaveColumn(o,b, tipDn, CONFIG.H, false);
     return;
   }
-  const w=pxs(o.w), x=pxs(o.x - w/2);
+  const w=pxs(o.w), x=Math.round(o.x - w/2);
   const TIPLEN = 30;
   drawColumn(o,b,x,w, CONFIG.HUD_H, tipUp, true,  TIPLEN);  // ceiling piece
   drawColumn(o,b,x,w, tipDn, CONFIG.H, false, TIPLEN);      // floor piece
@@ -993,7 +1028,7 @@ function drawObstacle(o,b){
 // dripping cave rock: wide base it emerges from, tapering to a rounded drip point.
 // soft shading only — no black per-pixel borders.
 function drawCaveColumn(o,b,topY,botY,isCeil){
-  const w=pxs(o.w), cx=pxs(o.x);
+  const w=pxs(o.w), cx=Math.round(o.x);
   const maxHalf=w/2;
   const attach = isCeil ? topY : botY;   // base / emergence end
   const len = Math.max(PX, botY-topY);
@@ -1003,15 +1038,15 @@ function drawCaveColumn(o,b,topY,botY,isCeil){
     let hw = maxHalf * (Math.sqrt(Math.max(0,1-t))*0.88 + 0.14*Math.sin(t*Math.PI));
     if(t<0.12) hw = Math.max(hw, maxHalf*(1.0 + (0.12-t)*1.6));   // flared footing at the base
     hw += (h2(o.seed,y,9)-0.5)*PX*1.1;                            // stable organic wobble
-    hw = Math.max(t>0.9?PX:PX*2, pxs(hw));
-    const rowW=pxs(hw*2), rowX=pxs(cx-hw);
+    hw = Math.max(t>0.9?PX:PX*2, Math.round(hw));
+    const rowW=Math.round(hw*2), rowX=Math.round(cx-hw);
     if(rowW<PX) continue;
     ctx.fillStyle=b.oMid;   ctx.fillRect(rowX, y, rowW, PX);            // body
     ctx.fillStyle=b.oLight; ctx.fillRect(rowX, y, PX*2, PX);            // lit left rim (no outline)
     ctx.fillStyle=b.oDark;  ctx.fillRect(rowX+rowW-PX*2, y, PX*2, PX);  // shadow right
     // sparse light mottling only (keeps it clean, no dark speckle borders)
     const r=h2(o.seed, y, 13), inner=Math.max(0,rowW-PX*5);
-    if(r>0.88 && inner>0){ ctx.fillStyle=b.oLight; ctx.fillRect(rowX+PX*2+pxs((r%0.25/0.25)*inner), y, PX, PX); }
+    if(r>0.88 && inner>0){ ctx.fillStyle=b.oLight; ctx.fillRect(rowX+PX*2+Math.round((r%0.25/0.25)*inner), y, PX, PX); }
   }
 }
 function drawColumn(o,b,x,w,top,bot,isCeil,tipLen){
@@ -1212,9 +1247,9 @@ function drawSelect(){
   drawDragonCard('fire', 20, 215, 165, 230);
   drawDragonCard('ice', 205, 215, 165, 230);
 
-  // FLY button
+  // FLY button -> choose starting environment
   const d=DRAGONS[SAVE.dragon];
-  button('FLY', 30, 480, CONFIG.W-60, 64, d.color, '#fff', ()=>{ Audio_.click(); startRun(); }, {fs:20,r:12});
+  button('FLY', 30, 480, CONFIG.W-60, 64, d.color, '#fff', ()=>{ Audio_.click(); state='envselect'; }, {fs:20,r:12});
   // SHOP
   button('SHOP', 30, 558, CONFIG.W-60, 50, '#3A1A5A', '#F5C518', ()=>{ Audio_.click(); shopScroll=0; state='shop'; }, {fs:14,r:10});
 
@@ -1224,6 +1259,45 @@ function drawSelect(){
   drawDragonSprite(CONFIG.W/2, 720, 1.6, Math.floor(performance.now()/130)%3, 0, 1, null);
   // settings gear (top-right of the column)
   gearButton(CONFIG.W-34, 34, ()=>{ Audio_.click(); settingsReturn='select'; settingsScroll=0; state='settings'; });
+}
+// --- environment selection (after dragon pick) ---
+function drawBiomePreview(b,x,y,w,h){
+  ctx.save();
+  roundRect(x,y,w,h,6); ctx.clip();
+  const g=ctx.createLinearGradient(0,y,0,y+h); g.addColorStop(0,b.bgTop); g.addColorStop(1,b.bgBot);
+  ctx.fillStyle=g; ctx.fillRect(x,y,w,h);
+  ctx.fillStyle=b.silNear; ctx.fillRect(x,y+h-5,w,5);              // ground
+  for(let i=0;i<2;i++){
+    const fx=Math.round(x+14+i*(w-22));
+    ctx.fillStyle=b.oMid;   ctx.fillRect(fx, y+h-5-13, 8, 13);     // stalagmite
+    ctx.fillStyle=b.oLight; ctx.fillRect(fx, y+h-5-13, 2, 13);
+    ctx.fillStyle=b.oMid;   ctx.fillRect(fx+1, y, 6, 11);          // stalactite
+  }
+  ctx.restore();
+  ctx.strokeStyle='#2A2040'; ctx.lineWidth=2; roundRect(x,y,w,h,6); ctx.stroke();
+}
+function drawEnvSelect(){
+  buttons=[];
+  text('CHOOSE START', CONFIG.W/2, 48, '#F5C518', 16);
+  const d=DRAGONS[SAVE.dragon];
+  button('FULL JOURNEY', 44, 72, CONFIG.W-88, 50, d.color, '#fff', ()=>{ Audio_.click(); startRun(0); }, {fs:14,r:12});
+  text('PLAY ALL AREAS IN ORDER', CONFIG.W/2, 134, '#777', 6);
+  let y=152; const cardH=84;
+  for(let i=0;i<BIOMES.length;i++){
+    const b=BIOMES[i], unlocked=!!SAVE.unlocked[i];
+    ctx.globalAlpha = unlocked?1:0.5;
+    ctx.fillStyle='#160E2A'; roundRect(22,y,CONFIG.W-44,cardH,10); ctx.fill();
+    ctx.lineWidth=2; ctx.strokeStyle = unlocked? b.accent : '#2A2040'; roundRect(22,y,CONFIG.W-44,cardH,10); ctx.stroke();
+    drawBiomePreview(b, 32, y+12, 96, cardH-24);
+    text(b.name, 144, y+30, '#fff', 9, 'left');
+    if(unlocked){ text('TAP TO START HERE', 144, y+56, '#3CB371', 7, 'left'); }
+    else { text('LOCKED', 144, y+52, '#E0563B', 8, 'left'); text('REACH '+(i*CONFIG.BIOME_LEN)+' TO UNLOCK', 144, y+68, '#999', 6, 'left'); }
+    ctx.globalAlpha=1;
+    if(unlocked){ buttons.push({x:22,y,w:CONFIG.W-44,h:cardH,fn:()=>{ Audio_.click(); startRun(i); }}); }
+    y+=cardH+8;
+  }
+  button('BACK', 30, CONFIG.H-66, CONFIG.W-60, 48, '#3A1A5A', '#F5C518', ()=>{ Audio_.click(); state='select'; }, {fs:14,r:10});
+  gearButton(CONFIG.W-30, 30, ()=>{ Audio_.click(); settingsReturn='envselect'; settingsScroll=0; state='settings'; });
 }
 function drawDragonCard(key,x,y,w,h){
   const d=DRAGONS[key]; const sel=SAVE.dragon===key;
@@ -1326,7 +1400,7 @@ function drawGameOver(){
   // leaderboard
   drawBoard(420, -1);
   // buttons
-  button('PLAY AGAIN', 30, 640, CONFIG.W-60, 58, '#E74C3C', '#fff', ()=>{ Audio_.click(); startRun(); }, {fs:16,r:12});
+  button('PLAY AGAIN', 30, 640, CONFIG.W-60, 58, '#E74C3C', '#fff', ()=>{ Audio_.click(); startRun(lastStartBiome); }, {fs:16,r:12});
   button('SHOP', 30, 712, (CONFIG.W-72)/2, 48, '#3A1A5A', '#F5C518', ()=>{ Audio_.click(); shopScroll=0; state='shop'; }, {fs:13,r:10});
   button('MAIN MENU', 30+(CONFIG.W-72)/2+12, 712, (CONFIG.W-72)/2, 48, '#2A1640', '#cbd', ()=>{ Audio_.click(); state='select'; }, {fs:11,r:10});
   // settings gear (top-right)
@@ -1440,17 +1514,25 @@ function gearButton(cx,cy,fn){
 }
 function drawSettings(){
   buttons=[];
-  text('SETTINGS', CONFIG.W/2, 48, '#F5C518', 16);
-  // sound toggle
-  let y=80;
-  ctx.fillStyle='#160E2A'; roundRect(24,y,CONFIG.W-48,46,10); ctx.fill();
-  ctx.lineWidth=2; ctx.strokeStyle='#2A2040'; roundRect(24,y,CONFIG.W-48,46,10); ctx.stroke();
-  text('SOUND', 42, y+23, '#fff', 10, 'left');
+  text('SETTINGS', CONFIG.W/2, 40, '#F5C518', 16);
+  // sound toggle (fixed)
+  const yt=62;
+  ctx.fillStyle='#160E2A'; roundRect(24,yt,CONFIG.W-48,42,10); ctx.fill();
+  ctx.lineWidth=2; ctx.strokeStyle='#2A2040'; roundRect(24,yt,CONFIG.W-48,42,10); ctx.stroke();
+  text('SOUND', 42, yt+21, '#fff', 10, 'left');
   const on=!SAVE.muted;
-  button(on?'ON':'OFF', CONFIG.W-40-74, y+8, 74, 30, on?'#2ECC71':'#4a3a3a', on?'#06210f':'#cbb', ()=>{ SAVE.muted=!SAVE.muted; Audio_.setMute(SAVE.muted); saveAll(); Audio_.click(); }, {fs:10,r:8});
-  // power-up guide
-  y=148;
-  text('POWER-UP GUIDE', CONFIG.W/2, y, '#5BC8F5', 10); y+=22;
+  button(on?'ON':'OFF', CONFIG.W-40-74, yt+6, 74, 30, on?'#2ECC71':'#4a3a3a', on?'#06210f':'#cbb', ()=>{ SAVE.muted=!SAVE.muted; Audio_.setMute(SAVE.muted); saveAll(); Audio_.click(); }, {fs:10,r:8});
+
+  const viewTop=118, viewBot=CONFIG.H-66, viewH=viewBot-viewTop;
+  // total scrollable content height
+  let ch=24 + POWERUP_GUIDE.length*(66+10) + 44 + BUFFS.length*(60+8);
+  const maxScroll=Math.max(0, ch-viewH);
+  settingsScroll = Math.max(0, Math.min(maxScroll, settingsScroll));
+
+  ctx.save();
+  roundRect(18,viewTop-4,CONFIG.W-36,viewH+8,10); ctx.clip();
+  let y=viewTop - settingsScroll;
+  text('POWER-UP GUIDE', CONFIG.W/2, y+8, '#5BC8F5', 10); y+=24;
   for(const [type,name,desc] of POWERUP_GUIDE){
     const h=66;
     ctx.fillStyle='#140C26'; roundRect(24,y,CONFIG.W-48,h,10); ctx.fill();
@@ -1461,7 +1543,26 @@ function drawSettings(){
     wrapTextLeft(desc, 92, y+44, CONFIG.W-92-30, 12, '#9aa', 7);
     y+=h+10;
   }
-  button('BACK', 30, CONFIG.H-66, CONFIG.W-60, 48, '#3A1A5A', '#F5C518', ()=>{ Audio_.click(); state=settingsReturn||'select'; }, {fs:14,r:10});
+  text('AREA REWARD BUFFS', CONFIG.W/2, y+12, '#F5C518', 10);
+  text('PICK ONE AFTER CLEARING EACH AREA', CONFIG.W/2, y+28, '#777', 6); y+=44;
+  for(const bf of BUFFS){
+    const h=60;
+    ctx.fillStyle='#140C26'; roundRect(24,y,CONFIG.W-48,h,10); ctx.fill();
+    ctx.lineWidth=2; ctx.strokeStyle='#2A2040'; roundRect(24,y,CONFIG.W-48,h,10); ctx.stroke();
+    ctx.fillStyle=bf.color; ctx.beginPath(); ctx.arc(54,y+30,11,0,7); ctx.fill();
+    text(bf.name, 80, y+20, '#fff', 8, 'left');
+    wrapTextLeft(bf.desc, 80, y+38, CONFIG.W-80-30, 11, '#9aa', 6);
+    y+=h+8;
+  }
+  ctx.restore();
+
+  // scrollbar
+  if(maxScroll>0){
+    const th=Math.max(26, viewH*viewH/ch), ty=viewTop + (viewH-th)*(settingsScroll/maxScroll);
+    ctx.fillStyle='rgba(255,255,255,0.08)'; roundRect(CONFIG.W-13,viewTop,4,viewH,2); ctx.fill();
+    ctx.fillStyle='rgba(245,197,24,0.55)'; roundRect(CONFIG.W-13,ty,4,th,2); ctx.fill();
+  }
+  button('BACK', 30, CONFIG.H-56, CONFIG.W-60, 44, '#3A1A5A', '#F5C518', ()=>{ Audio_.click(); state=settingsReturn||'select'; }, {fs:14,r:10});
 }
 
 function playAgain(){ state='select'; }
@@ -1487,6 +1588,7 @@ function frame(){
     if(OX>0){ ctx.fillStyle='#0A041A'; ctx.fillRect(0,0,OX,CONFIG.H); ctx.fillRect(OX+CONFIG.W,0,VW-OX-CONFIG.W,CONFIG.H); }
     ctx.save(); ctx.translate(OX,0);
     if(state==='select') drawSelect();
+    else if(state==='envselect') drawEnvSelect();
     else if(state==='shop') drawShop();
     else if(state==='settings') drawSettings();
     ctx.restore();
