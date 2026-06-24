@@ -167,6 +167,8 @@ const BASE_HUD = 54;
 const satProbe = document.getElementById('sat');
 function resize(){
   const cssW = window.innerWidth, cssH = window.innerHeight;
+  // ignore obviously transient/degenerate viewport reports during rotation
+  if(cssW < 50 || cssH < 50) return;
   const dpr = Math.max(1, Math.min(3, window.devicePixelRatio||1));
   const aspect = cssW/cssH;
   // Portrait (phones / portrait tablets) => full iPhone-sized column, no side bars.
@@ -187,7 +189,29 @@ function resize(){
   cv.style.height = cssH + 'px';
   ctx.imageSmoothingEnabled = false;
 }
-window.addEventListener('resize', resize); resize();
+// Re-run resize after layout settles. iOS reports stale innerWidth/innerHeight and
+// stale env(safe-area-inset-top) for a few frames after an orientation change, which
+// previously left OX / SAFE_TOP / the canvas backing store "stuck" at landscape values
+// once the user returned to portrait. We re-measure several times so the final, correct
+// portrait dimensions win. This does not alter the resize math itself, so the already
+// good portrait and desktop layouts are unchanged.
+let _resizeScheduled=false;
+function scheduleResize(){
+  resize();                                   // immediate pass (matches old behavior)
+  if(_resizeScheduled) return;
+  _resizeScheduled=true;
+  // staggered re-measures to catch the settled viewport after iOS finishes rotating
+  [60,180,350,600].forEach(d=>setTimeout(()=>{ resize(); _resizeScheduled=false; }, d));
+}
+window.addEventListener('resize', scheduleResize);
+window.addEventListener('orientationchange', scheduleResize);
+if(window.visualViewport){
+  window.visualViewport.addEventListener('resize', scheduleResize);
+  window.visualViewport.addEventListener('scroll', scheduleResize);
+}
+// also re-measure when the page becomes visible again (rotation can happen off-screen)
+document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) scheduleResize(); });
+resize();
 
 // ============================================================
 //  SPRITES (embedded base64, 3-frame flying strips)
@@ -316,7 +340,29 @@ const Audio_ = {
     };
     step();
   },
-  stopTitleMusic(){ if(this.titleTimer){ clearTimeout(this.titleTimer); this.titleTimer=null; } }
+  stopTitleMusic(){ if(this.titleTimer){ clearTimeout(this.titleTimer); this.titleTimer=null; } },
+  // ---- SHOP MUSIC: relaxed, upbeat little loop, distinct from the title theme ----
+  shopTimer:null, shopStep:0,
+  // bright major-ish bouncing pattern
+  shopMelody:[0,4,7,12,7,4,9,5,7,4,0,4,7,11,12,7,9,4],
+  shopRoot:175, // F3-ish
+  startShopMusic(){
+    if(this.shopTimer||!this.ctx) return;
+    this.shopStep=0;
+    const step=()=>{
+      const mel=this.shopMelody, n=mel[this.shopStep%mel.length];
+      const f=this.shopRoot*Math.pow(2,n/12);
+      this.tone(f*2,0.14,'square',0.09,0,null,this.musicGain);          // plucky lead
+      if(this.shopStep%2===0) this.tone(this.shopRoot,0.30,'triangle',0.12,0,null,this.musicGain); // bass
+      if(this.shopStep%4===2) this.tone(f*3,0.10,'sine',0.04,0,null,this.musicGain);  // light shimmer
+      this.shopStep++;
+      this.shopTimer=setTimeout(step,250);
+    };
+    step();
+  },
+  stopShopMusic(){ if(this.shopTimer){ clearTimeout(this.shopTimer); this.shopTimer=null; } },
+  // stop every music source at once (used by the central manager before switching)
+  stopAllMusic(){ this.stopMusic(); this.stopTitleMusic(); this.stopShopMusic(); }
 };
 
 // ============================================================
@@ -1328,9 +1374,10 @@ function drawIcon(type,cx,cy,size){
   else { ctx.fillStyle='#9aa3b8'; ctx.beginPath(); ctx.arc(cx,cy,size*0.4,0,7); ctx.fill(); }
 }
 
+// shared power-up color map (used by floating power-ups and the HUD timer bars)
+const POWERUP_COLORS={shield:'#5BC8F5',magnet:'#E0563B',tiny:'#E74C3C',ghost:'#DCE6F2',coinburst:'#F5C518',slowfield:'#C0C7D0',doublepoints:'#F5C518'};
 function drawPowerup(p){
-  const cmap={shield:'#5BC8F5',magnet:'#E0563B',tiny:'#E74C3C',ghost:'#DCE6F2',coinburst:'#F5C518',slowfield:'#C0C7D0',doublepoints:'#F5C518'};
-  const col=cmap[p.type]||'#fff';
+  const col=POWERUP_COLORS[p.type]||'#fff';
   ctx.save();
   ctx.globalAlpha=0.45+0.2*Math.sin(G.frame*0.18); ctx.fillStyle=col;
   ctx.beginPath(); ctx.arc(p.x,p.y,CONFIG.POWERUP_R+5,0,7); ctx.fill();   // soft glow halo
@@ -1358,13 +1405,32 @@ function drawHUD(){
   text(G.runCoins, CONFIG.W-86, t+14, '#F5C518', 10, 'left');
   // pause button (far top-right)
   if(!G.dead) pauseButton(CONFIG.W-22, t+18);
-  // active timed powerup indicators (below the bar)
-  let iy=CONFIG.HUD_H+6, ix=CONFIG.W-70;
-  const tlist=[['magnet',G.timers.magnet,15],['tiny',G.timers.tiny,20],['slowField',G.timers.slowField,12],['doublePoints',G.timers.doublePoints,20]];
-  for(const [name,t2,max] of tlist){ if(t2>0){
-    ctx.fillStyle='rgba(0,0,0,0.4)'; ctx.fillRect(ix,iy,64,8);
-    ctx.fillStyle='#5BC8F5'; ctx.fillRect(ix,iy,64*(t2/(max*60)),8);
-    text(name.toUpperCase().slice(0,6),ix-4,iy+4,'#9FE',6,'right'); iy+=12;
+  // active timed power-up indicators (below the HUD bar): icon + full name + colored progress bar
+  let iy=CONFIG.HUD_H+8;
+  const BARW=120, BARH=12, ICONSZ=18;
+  // [timer key, icon/color key, display name, max seconds]
+  const tlist=[
+    ['magnet','magnet','MAGNET',15],
+    ['tiny','tiny','TINY',20],
+    ['slowField','slowfield','SLOW FIELD',12],
+    ['doublePoints','doublepoints','DOUBLE POINTS',20],
+  ];
+  for(const [tkey,ikey,label,max] of tlist){ const t2=G.timers[tkey]; if(t2>0){
+    const col=POWERUP_COLORS[ikey]||'#5BC8F5';
+    const barX=CONFIG.W-12-BARW;
+    const iconCx=barX-ICONSZ/2-6, iconCy=iy+BARH/2;
+    // icon
+    drawIcon(ikey, iconCx, iconCy, ICONSZ);
+    // bar track
+    ctx.fillStyle='rgba(0,0,0,0.45)'; roundRect(barX,iy,BARW,BARH,4); ctx.fill();
+    // bar fill (power-up color)
+    const fillW=Math.max(0,BARW*(t2/(max*60)));
+    if(fillW>0){ ctx.fillStyle=col; roundRect(barX,iy,fillW,BARH,4); ctx.fill(); }
+    // name label centered on the bar, with a readable outline
+    setFont(6); ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillStyle='rgba(0,0,0,0.6)'; ctx.fillText(label, barX+BARW/2+0.5, iy+BARH/2+1.5);
+    ctx.fillStyle='#fff'; ctx.fillText(label, barX+BARW/2, iy+BARH/2+1);
+    iy+=BARH+6;
   }}
 }
 function pauseButton(cx,cy){
@@ -1771,7 +1837,7 @@ function drawGameOverName(){
   button('SAVE NAME', 30, CONFIG.H-66, CONFIG.W-60, 48, '#F5C518', '#000', ()=>{ Audio_.click(); commitName(); }, {fs:13,r:10});
   ctx.restore();
 }
-const KB_ROWS=['QWERTYUIOP','ASDFGHJKL','ZXCVBNM','0123456789'];
+const KB_ROWS=['0123456789','QWERTYUIOP','ASDFGHJKL','ZXCVBNM'];
 let kbFlash={};  // char -> timestamp(ms) of last press, for visual feedback
 function kbPress(ch){ kbFlash[ch]=performance.now(); }
 function kbLit(ch){ const t=kbFlash[ch]; return t && (performance.now()-t)<180; }
@@ -1947,13 +2013,25 @@ function frame(){
     ctx.restore();
   }
 
-  // title-screen music: plays whenever the title is showing (and audio is ready/unmuted)
-  if(state==='select'){
-    if(prevState!=='select') carouselInit();
-    if(Audio_.ctx && !SAVE.muted && Audio_.ctx.state==='running') Audio_.startTitleMusic();
-  } else {
-    Audio_.stopTitleMusic();
+  // ---- centralized music manager ----
+  // Decide which track should be playing based on the current screen.
+  // 'title'  -> select / envselect / (settings opened from the main menu)
+  // 'shop'   -> shop
+  // 'biome'  -> playing / paused / milestone (handled by startRun/resumeGame)
+  // 'none'   -> gameover, gameover_name, settings opened from game over
+  if(Audio_.ctx && !SAVE.muted && Audio_.ctx.state==='running'){
+    let want='none';
+    if(state==='select' || state==='envselect') want='title';
+    else if(state==='shop') want='shop';
+    else if(state==='settings') want = (settingsReturn==='gameover') ? 'none' : 'title';
+    else if(state==='playing' || state==='paused' || state==='milestone') want='biome';
+    // apply: start the wanted track, stop the others (biome music is managed elsewhere)
+    if(want==='title'){ Audio_.stopShopMusic(); Audio_.startTitleMusic(); }
+    else if(want==='shop'){ Audio_.stopTitleMusic(); Audio_.startShopMusic(); }
+    else if(want==='none'){ Audio_.stopTitleMusic(); Audio_.stopShopMusic(); }
+    else if(want==='biome'){ Audio_.stopTitleMusic(); Audio_.stopShopMusic(); }
   }
+  if(state==='select' && prevState!=='select') carouselInit();
   prevState=state;
 
   requestAnimationFrame(frame);
