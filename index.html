@@ -103,13 +103,55 @@ function saveAll(){
 const UPGRADES = [
   {id:'extraHeart', name:'EXTRA HEART', desc:'+1 starting HP (max 3 total)', cost:30, max:2, icon:{src:'heart',key:'full'}},
   {id:'coinMagnet', name:'COIN MAGNET', desc:'Small passive coin attraction', cost:25, max:1, icon:{src:'icon',key:'magnet'}},
-  {id:'luckyFind',  name:'LUCKY FIND',  desc:'Power-up spawn rate +5%', cost:35, max:2, icon:{src:'shop',key:'clover'}},
+  {id:'luckyFind',  name:'LUCKY FIND',  desc:'Rare & ultra coin odds x1.5 per level', cost:35, max:2, icon:{src:'shop',key:'clover'}},
   {id:'piggyBank',  name:'PIGGY BANK',  desc:'Each coin collected counts x2', cost:40, max:1, icon:{src:'shop',key:'piggy'}},
   {id:'forgivingGap',name:'MINIMIZE',desc:'Your dragon is 15% smaller', cost:50, max:1, icon:{src:'icon',key:'tiny'}},
   {id:'secondWind', name:'PHOENIX UP', desc:'You are revived once per run', cost:60, max:1, icon:{src:'shop',key:'phoenix'}},
   {id:'highBonus',  name:'HIGH SCORE BONUS', desc:'+5 coins when you achieve a top 3 highscore', cost:45, max:1, icon:{src:'shop',key:'trophy'}},
 ];
 function upLvl(id){ return SAVE.upgrades[id]||0; }
+// Each additional level costs more: base x (level+1). So level 1 = base, level 2 = base x2.
+function upCost(u){ return u.cost * (upLvl(u.id)+1); }
+
+// ---- Start-of-run boosts (bought on the Choose Start screen; one per run) ----
+// magnet/tiny/double score run for 60s; shield is a one-hit guard that lasts until used.
+const STARTERS = [
+  {type:'shield',       label:'SHIELD',   dur:'1 HIT', cost:15},
+  {type:'tiny',         label:'TINY',     dur:'60s',   cost:20},
+  {type:'magnet',       label:'MAGNET',   dur:'60s',   cost:20},
+  {type:'doublepoints', label:'2X SCORE', dur:'60s',   cost:30},
+];
+let starterPowerup = null;   // pending pick on the Choose Start screen (charged at run start)
+function starterCost(type){ const s=STARTERS.find(x=>x.type===type); return s?s.cost:0; }
+// Add time to a timed power-up. If it's already running, this only ADDS time and keeps the
+// existing bar scale (so a 60s start-boost stays a 60s bar; a mid-run pickup tops it up rather
+// than shrinking/resetting it). A fresh activation (timer at 0) sets the bar's full scale.
+function addTimer(key, frames){
+  const cur = G.timers[key]||0;
+  if(!G.timerPeak) G.timerPeak={};
+  if(cur<=0) G.timerPeak[key]=frames;     // fresh activation defines the bar's "full"
+  G.timers[key] = cur + frames;            // stacking only extends time; bar scale unchanged
+}
+function applyStarter(){
+  const type = starterPowerup;
+  if(!type) return;
+  const cost = starterCost(type);
+  if(SAVE.coins < cost){ starterPowerup=null; return; }   // can't afford — skip
+  SAVE.coins -= cost; saveAll();
+  switch(type){
+    case 'shield':       G.shield = Math.max(G.shield,1); break;
+    case 'magnet':       addTimer('magnet', 60*60); break;
+    case 'tiny':         addTimer('tiny', 60*60); break;
+    case 'doublepoints': addTimer('doublePoints', 60*60); break;
+  }
+  starterPowerup = null;   // consumed: one per run
+}
+// ---- Coin reference (for the encyclopedia) ----
+const COIN_GUIDE = [
+  {kind:'normal', name:'GOLD COIN', worth:1},
+  {kind:'rare',   name:'BLUE COIN', worth:5},
+  {kind:'ultra',  name:'RED COIN',  worth:10},
+];
 
 // ---- Dragons ----
 const DRAGONS = {
@@ -431,10 +473,12 @@ function startRun(startBiome){
   G.ancestorsFlame = 0;     // remaining obstacle-destroys
   // timed power-ups
   G.timers = { magnet:0, tiny:0, slowField:0, doublePoints:0, ghost:0 };
+  G.timerPeak = { magnet:0, tiny:0, slowField:0, doublePoints:0, ghost:0 }; // bar reference (peak duration while active)
   G.invuln = 0;             // post-hit grace frames
   G.cursedCounter = 0;
   // ability counters tracked via G.streak
   particlesBG = []; fxParticles = []; shake=0; flash=0;
+  applyStarter();           // equip & charge the chosen start boost (one per run)
   Audio_.setBiome(startBiome); Audio_.startMusic();
   saveAll();
   state = 'playing';
@@ -468,17 +512,20 @@ function spawnPair(){
   const coinChance = CONFIG.COIN_SPAWN_CHANCE * (goldRush?2:1);
   if(Math.random() < Math.min(0.98,coinChance)){
     const n = rint(1,3);
+    const luck = Math.pow(1.5, upLvl('luckyFind'));         // LUCKY FIND: x1.5 rare/ultra odds per level
+    const ultraC = CONFIG.ULTRA_CHANCE * luck;
+    const rareC  = CONFIG.RARE_CHANCE  * luck;
     for(let i=0;i<n;i++){
       let val=1, kind='normal';
       const r=Math.random();
-      if(r < CONFIG.ULTRA_CHANCE){ val=10; kind='ultra'; }
-      else if(r < CONFIG.RARE_CHANCE+CONFIG.ULTRA_CHANCE){ val=5; kind='rare'; }
+      if(r < ultraC){ val=10; kind='ultra'; }
+      else if(r < rareC+ultraC){ val=5; kind='rare'; }
       G.coins.push({ x:CONFIG.W+CONFIG.OBST_W+CONFIG.OBST_SPACING*0.5 + i*26,
         y: gy + rnd(-gap*0.3,gap*0.3), val, kind, dead:false, mag:false });
     }
   }
   // power-up
-  let puChance = CONFIG.POWERUP_SPAWN_CHANCE * (1 + 0.05*upLvl('luckyFind'));
+  let puChance = CONFIG.POWERUP_SPAWN_CHANCE;
   if(Math.random() < puChance){
     const pool = ['shield','magnet','tiny','ghost','coinburst','slowfield','doublepoints'];
     let type = pool[rint(0,pool.length-1)];
@@ -591,7 +638,7 @@ function update(){
   G.powerups = G.powerups.filter(p=> p.x>-30 && !p.dead);
 
   // timers tick (frames)
-  for(const k in G.timers){ if(G.timers[k]>0) G.timers[k]--; }
+  for(const k in G.timers){ if(G.timers[k]>0){ G.timers[k]--; if(G.timers[k]===0 && G.timerPeak) G.timerPeak[k]=0; } }
 
   // Area transition: begin a GRADUAL crossfade 5 obstacles before the boundary (e.g. at 70),
   // let it build while the player clears those 5, then finalize the biome swap and open the
@@ -809,11 +856,11 @@ function collectPowerup(p){
   p.dead=true; Audio_.powerup(); explode(p.x,p.y,'#fff',10);
   switch(p.type){
     case 'shield': if(!G.mods.cursedHoard && G.shield<1){ G.shield=1; } break;
-    case 'magnet': G.timers.magnet = 15*60; break;
-    case 'tiny': G.timers.tiny = 20*60; break;
-    case 'ghost': G.timers.ghost = 15*60; break;
-    case 'slowfield': G.timers.slowField = 12*60; break;
-    case 'doublepoints': G.timers.doublePoints = 20*60; break;
+    case 'magnet': addTimer('magnet', 15*60); break;
+    case 'tiny': addTimer('tiny', 20*60); break;
+    case 'ghost': addTimer('ghost', 15*60); break;
+    case 'slowfield': addTimer('slowField', 12*60); break;
+    case 'doublepoints': addTimer('doublePoints', 20*60); break;
     case 'coinburst':
       // spawn 5 coins in horizontal GAPS between obstacle columns so they're always reachable
       // (a coin's x never lines up with a rock column, now or as the world scrolls).
@@ -1366,7 +1413,7 @@ function spireHalfWidth(o,maxHalf,t,y){
   hw += (h2(o.seed,y,9)-0.5)*PX*1.1;
   return hw;
 }
-// ICE: frozen crystalline spire — cool body, faceted left-light highlight, sparkle flecks
+// ICE: frozen crystalline spire — cool faceted body with jagged internal fracture cracks
 function drawIceColumn(o,b,topY,botY,isCeil){
   const w=pxs(o.w), cx=Math.round(o.x);
   const maxHalf=w/2;
@@ -1381,22 +1428,40 @@ function drawIceColumn(o,b,topY,botY,isCeil){
     ctx.fillStyle=b.oMid;   ctx.fillRect(rowX, y, rowW, PX);            // icy body
     ctx.fillStyle=b.oLight; ctx.fillRect(rowX, y, PX*2, PX);            // bright lit rim
     ctx.fillStyle=b.oDark;  ctx.fillRect(rowX+rowW-PX*2, y, PX*2, PX);  // cool shadow edge
-    // horizontal frost growth-bands (the layered look of a real icicle)
-    if(rowW>PX*4 && (((y/PX)|0) % 5)===0){
-      ctx.globalAlpha=0.32; ctx.fillStyle=b.oLight;
-      ctx.fillRect(rowX+PX, y, rowW-PX*2, PX); ctx.globalAlpha=1;
-    }
-    // glassy inner glints — short BROKEN dashes (never a continuous vertical line)
-    if(rowW>PX*5 && h2(o.seed,y,8)>0.55){
-      ctx.globalAlpha=0.45; ctx.fillStyle=b.acc2;
-      ctx.fillRect(rowX+PX*3, y, PX, PX); ctx.globalAlpha=1;
-    }
-    // sparkle flecks (more frequent + twinkling)
+    // frost sparkle flecks (twinkle)
     const r=h2(o.seed, y, 13), inner=Math.max(0,rowW-PX*5);
-    if(r>0.80 && inner>0){
-      ctx.globalAlpha=0.65+0.35*Math.sin(G.frame*0.2 + y*0.3 + o.seed);
+    if(r>0.82 && inner>0){
+      ctx.globalAlpha=0.6+0.4*Math.sin(G.frame*0.2 + y*0.3 + o.seed);
       ctx.fillStyle=b.acc2; ctx.fillRect(rowX+PX*2+Math.round((r%0.25/0.25)*inner), y, PX, PX);
       ctx.globalAlpha=1;
+    }
+  }
+  // jagged internal cracks (deterministic, chiseled — a dark fracture with a lit glint beside it)
+  const dirY = (attach===topY) ? PX : -PX;
+  const nCracks = 2 + (o.seed%2);
+  for(let ci=0; ci<nCracks; ci++){
+    let x = cx + (h2(o.seed, ci, 21)-0.5)*maxHalf*0.9;
+    let y = (attach===topY ? topY : botY-PX) + dirY*Math.floor(h2(o.seed,ci,22)*(len/PX)*0.18)*1;
+    const steps = Math.floor((len/PX)*(0.4+0.35*h2(o.seed,ci,24)));
+    for(let s=0; s<steps; s++){
+      y += dirY;
+      if(y<topY || y>=botY) break;
+      const j=h2(o.seed, y, ci*5+30);                  // sharp jog: ±PX or straight (jagged)
+      x += (j<0.32? -PX : (j>0.68? PX : 0));
+      const t=Math.min(1, Math.abs((y+PX/2)-attach)/len);
+      const hwc=Math.max(PX, Math.round(spireHalfWidth(o,maxHalf,t,y)));
+      if(Math.abs(x-cx) > hwc-PX) x = cx + Math.sign(x-cx)*(hwc-PX);   // hug the inner edge
+      ctx.fillStyle=b.oDark;  ctx.fillRect(Math.round(x), y, PX, PX);                  // fracture
+      ctx.globalAlpha=0.75; ctx.fillStyle=b.acc2; ctx.fillRect(Math.round(x)-PX, y, PX, PX); ctx.globalAlpha=1; // glint on lit side
+      // occasional short fork branching off the crack
+      if(s>2 && h2(o.seed,y,ci*9+40)>0.88){
+        const fdir=(h2(o.seed,y,7)>0.5)?PX:-PX; let fx=x, fy=y;
+        for(let k=0;k<3+(o.seed%3);k++){ fx+=fdir; fy+=dirY; if(fy<topY||fy>=botY) break;
+          const t2=Math.min(1,Math.abs((fy+PX/2)-attach)/len); const hw2=Math.max(PX,Math.round(spireHalfWidth(o,maxHalf,t2,fy)));
+          if(Math.abs(fx-cx)>hw2-PX) break;
+          ctx.fillStyle=b.oDark; ctx.fillRect(Math.round(fx),fy,PX,PX);
+        }
+      }
     }
   }
   // glinting tip highlight
@@ -1404,13 +1469,14 @@ function drawIceColumn(o,b,topY,botY,isCeil){
   ctx.fillStyle=b.acc2; ctx.globalAlpha=0.6+0.4*Math.sin(G.frame*0.15+o.seed);
   ctx.fillRect(cx-PX, tipY, PX*2, PX); ctx.globalAlpha=1;
 }
-// LAVA: molten basalt spire — dark rock body with a glowing, pulsing molten core seam
+// LAVA: molten basalt spire — dark charred rock with a STATIONARY pixel-art network of
+// branching lava veins baked into it (deterministic per seed; no flowing animation).
 function drawLavaColumn(o,b,topY,botY,isCeil){
   const w=pxs(o.w), cx=Math.round(o.x);
   const maxHalf=w/2;
   const attach = isCeil ? topY : botY;
   const len = Math.max(PX, botY-topY);
-  const pulse = 0.55+0.45*Math.sin(G.frame*0.12+o.seed);
+  // ---- basalt body ----
   for(let y=pxs(topY); y<botY; y+=PX){
     const t = Math.min(1, Math.abs((y+PX/2)-attach)/len);
     let hw = spireHalfWidth(o,maxHalf,t,y);
@@ -1420,28 +1486,39 @@ function drawLavaColumn(o,b,topY,botY,isCeil){
     ctx.fillStyle=b.oMid;   ctx.fillRect(rowX, y, rowW, PX);            // basalt body
     ctx.fillStyle=b.oLight; ctx.fillRect(rowX, y, PX*2, PX);            // warm lit rim
     ctx.fillStyle=b.oDark;  ctx.fillRect(rowX+rowW-PX*2, y, PX*2, PX);  // charred shadow
-    // twisting molten rivulet — wanders left/right as it flows down (never a straight line),
-    // and animates downward so it reads as flowing lava
-    if(rowW>PX*4){
-      const flow = y*0.06 + G.frame*0.05;
-      const wander = Math.sin(flow)*(rowW*0.22) + Math.sin(flow*0.5 + o.seed)*(rowW*0.13);
-      const streamX = cx + wander;
-      if(streamX > rowX+PX && streamX < rowX+rowW-PX){
-        ctx.globalAlpha=0.5+0.4*pulse; ctx.fillStyle=b.accent;
-        ctx.fillRect(Math.round(streamX-PX), y, PX*2, PX);     // glowing channel
-        ctx.globalAlpha=0.85*pulse; ctx.fillStyle=b.acc2;
-        ctx.fillRect(Math.round(streamX-PX/2), y, PX, PX);     // bright molten core
-        ctx.globalAlpha=1;
-      }
-    }
-    // ember flecks
-    const r=h2(o.seed, y, 13), inner=Math.max(0,rowW-PX*5);
-    if(r>0.92 && inner>0){ ctx.globalAlpha=pulse; ctx.fillStyle=b.acc2; ctx.fillRect(rowX+PX*2+Math.round((r%0.25/0.25)*inner), y, PX, PX); ctx.globalAlpha=1; }
+    // static charred speckles
+    const r=h2(o.seed, y, 7), inner=Math.max(0,rowW-PX*5);
+    if(r<0.10 && inner>0){ ctx.fillStyle=b.oDark; ctx.fillRect(rowX+PX*2+Math.round((r*9%1)*inner), y, PX, PX); }
   }
-  // molten glow at the tip
+  // ---- branching molten veins (stationary artwork) ----
+  lavaVein(o,b,cx,maxHalf,attach,len,pxs(topY),botY,
+           cx + (h2(o.seed,1,2)-0.5)*maxHalf*0.4,
+           attach===topY ? pxs(topY)+PX : botY-PX,
+           (h2(o.seed,2,3)-0.5)*0.5, Math.floor(len*0.95/PX), PX*2, 0);
+  // glowing root pool where the vein emerges from the rock face
+  ctx.fillStyle=b.acc2; ctx.fillRect(cx-PX, attach===topY?pxs(topY):botY-PX*2, PX*2, PX*2);
+  // molten tip glow (static)
   const tipY = isCeil ? botY-PX*3 : topY;
-  ctx.globalAlpha=0.5+0.5*pulse; ctx.fillStyle=b.acc2;
-  ctx.fillRect(cx-PX, tipY, PX*2, PX*2); ctx.globalAlpha=1;
+  ctx.globalAlpha=0.9; ctx.fillStyle=b.acc2; ctx.fillRect(cx-PX, tipY, PX*2, PX*2); ctx.globalAlpha=1;
+}
+// One molten vein that snakes toward the tip and recursively forks — fully deterministic.
+function lavaVein(o,b,cx,maxHalf,attach,len,topY,botY, x,y, slope, length, thick, depth){
+  const dirY = (attach===topY) ? PX : -PX;
+  for(let i=0;i<length;i++){
+    y += dirY;
+    x += slope*PX + (h2(o.seed, y, depth*4+3)-0.5)*1.3*PX;   // stationary wander (no frame term)
+    if(y<topY || y>=botY) break;
+    const t=Math.min(1, Math.abs((y+PX/2)-attach)/len);
+    const hw=Math.max(PX, Math.round(spireHalfWidth(o,maxHalf,t,y)));
+    if(Math.abs(x-cx) > hw-PX) break;          // vein left the rock — stop
+    ctx.fillStyle=b.accent; ctx.fillRect(Math.round(x-thick/2), y, thick, PX);     // glowing channel
+    if(thick>=PX*2){ ctx.fillStyle=b.acc2; ctx.fillRect(Math.round(x-PX/2), y, PX, PX); } // bright core
+    // fork off a thinner branch
+    if(depth<2 && i>2 && h2(o.seed, y, depth*11+7) > 0.82){
+      const side=(h2(o.seed,y,13)>0.5)?1:-1;
+      lavaVein(o,b,cx,maxHalf,attach,len,topY,botY, x, y, side*0.9, Math.floor(length*0.45), Math.max(PX,thick-PX), depth+1);
+    }
+  }
 }
 // ENCHANTED FOREST: a single tall mushroom per piece — a long pale stem rooted to the
 // ceiling/floor, topped with a domed cap (with spots + a glowing rim) at the gap-facing end.
@@ -1495,10 +1572,6 @@ function drawMushroomCap(o,b,cx,w,capTop,capBot,isCeil){
       ctx.fillStyle=spot; ctx.fillRect(sx, ry, PX, PX);
     }
   }
-  // glowing underside band where the cap meets the stem (enchanted accent)
-  const gy = isCeil ? capTop : capBot-PX;
-  ctx.globalAlpha=0.55+0.3*Math.sin(G.frame*0.1+o.seed); ctx.fillStyle=b.accent;
-  ctx.fillRect(Math.round(cx-w*0.4), gy, pxs(w*0.8), PX); ctx.globalAlpha=1;
 }
 function drawColumn(o,b,x,w,top,bot,isCeil,tipLen){
   top=pxs(top); bot=pxs(bot);
@@ -1794,7 +1867,8 @@ function drawHUD(){
     // bar track
     ctx.fillStyle='rgba(0,0,0,0.45)'; roundRect(barX,iy,BARW,BARH,4); ctx.fill();
     // bar fill (power-up color)
-    const fillW=Math.max(0,BARW*(t2/(max*60)));
+    const denom = (G.timerPeak && G.timerPeak[tkey]>0) ? G.timerPeak[tkey] : max*60;
+    const fillW=Math.max(0, Math.min(BARW, BARW*(t2/denom)));
     if(fillW>0){ ctx.fillStyle=col; roundRect(barX,iy,fillW,BARH,4); ctx.fill(); }
     // name label centered on the bar, with a readable outline
     setFont(6); ctx.textAlign='center'; ctx.textBaseline='middle';
@@ -2036,6 +2110,38 @@ function drawEnvSelect(){
     if(unlocked){ buttons.push({x:22,y,w:CONFIG.W-44,h:cardH,fn:()=>{ Audio_.click(); startRun(i); }}); }
     y+=cardH+8;
   }
+  // ---- START BOOST mini-shop (same footprint as a stage box; one purchase per run) ----
+  {
+    const bx=22, bw=CONFIG.W-44, bh=cardH, by=y;
+    ctx.fillStyle='#160E2A'; roundRect(bx,by,bw,bh,10); ctx.fill();
+    pixelBorder(bx,by,bw,bh, starterPowerup? '#F5C518' : '#3A2F55', 3);
+    text('START BOOST', bx+10, by+15, '#F5C518', 8, 'left');
+    text('1 PER RUN', bx+10, by+15+12, '#777', 6, 'left');
+    drawCoinCounter(bx+bw-10, by+16, SAVE.coins, 8, 6, '#F5C518');
+    const n=STARTERS.length, leftPad=92, gap=8, rightPad=10;
+    const tileW=(bw-leftPad-rightPad-(n-1)*gap)/n, tileH=bh-20, ty=by+11;
+    for(let i=0;i<n;i++){
+      const st=STARTERS[i], tx=bx+leftPad+i*(tileW+gap);
+      const selected = starterPowerup===st.type;
+      const afford = SAVE.coins>=st.cost;
+      ctx.globalAlpha = (afford||selected)?1:0.4;
+      ctx.fillStyle = selected? '#33290A' : '#0E0822'; roundRect(tx,ty,tileW,tileH,7); ctx.fill();
+      pixelBorder(tx,ty,tileW,tileH, selected? '#F5C518' : '#2A2040', 2);
+      drawIcon(st.type, tx+tileW/2, ty+14, 20);
+      text(st.dur, tx+tileW/2, ty+30, '#8a93b0', 6);
+      setFont(7); const cs=''+st.cost, tw=ctx.measureText(cs).width;
+      const cd=10, gp=3, grp=cd+gp+tw, gx0=tx+tileW/2-grp/2;
+      drawCoin(gx0+cd/2, ty+tileH-9, 4.6, 'normal');
+      text(cs, gx0+cd+gp, ty+tileH-9, selected?'#F5C518':'#cbb', 7, 'left');
+      ctx.globalAlpha=1;
+      buttons.push({x:tx,y:ty,w:tileW,h:tileH,fn:()=>{
+        if(starterPowerup===st.type){ starterPowerup=null; Audio_.click(); }
+        else if(SAVE.coins>=st.cost){ starterPowerup=st.type; Audio_.click(); }
+        else Audio_.buzz();
+      }});
+    }
+    y += bh+8;
+  }
   button('BACK', 30, CONFIG.H-66, CONFIG.W-60, 48, '#3A1A5A', '#F5C518', ()=>{ Audio_.click(); state='select'; }, {fs:14,r:10});
   gearButton(CONFIG.W-30, T+28, ()=>{ Audio_.click(); settingsReturn='envselect'; settingsView='main'; settingsScroll=0; state='settings'; });
 }
@@ -2096,7 +2202,7 @@ function drawShop(){
   button('BACK', 30, CONFIG.H-58, CONFIG.W-60, 44, '#3A1A5A', '#F5C518', ()=>{ Audio_.click(); state='select'; }, {fs:14,r:10});
 }
 function drawUpgradeCard(u, y, cardH){
-  const lvl=upLvl(u.id), maxed=lvl>=u.max, afford=SAVE.coins>=u.cost && !maxed;
+  const lvl=upLvl(u.id), maxed=lvl>=u.max, cost=upCost(u), afford=SAVE.coins>=cost && !maxed;
   const x=20, w=CONFIG.W-40;
   ctx.globalAlpha = maxed?0.7:1;
   ctx.fillStyle='#1A1030'; roundRect(x,y,w,cardH,12); ctx.fill();
@@ -2122,7 +2228,7 @@ function drawUpgradeCard(u, y, cardH){
     ctx.fillStyle=bg2; roundRect(bx,by,bw,bh,8); ctx.fill();
     pixelBorder(bx,by,bw,bh, afford?'#FFE07A':'#3A2F55', 2);
     // coin icon + cost inside the button
-    setFont(10); const cs=''+u.cost; const tw=ctx.measureText(cs).width;
+    setFont(10); const cs=''+cost; const tw=ctx.measureText(cs).width;
     const cd=14, gp=4, grp=cd+gp+tw, gx0=bx+bw/2-grp/2;
     drawCoin(gx0+cd/2, by+bh/2, 6.4, 'normal');
     text(cs, gx0+cd+gp, by+bh/2, fg, 10, 'left');
@@ -2137,9 +2243,9 @@ function wrapTextLeft(str,x,y,maxw,lh,color,fs){
   if(line) ctx.fillText(line,x,yy);
 }
 function buy(u){
-  const lvl=upLvl(u.id);
-  if(lvl>=u.max || SAVE.coins<u.cost){ Audio_.buzz(); return; }
-  SAVE.coins-=u.cost; SAVE.upgrades[u.id]=lvl+1; saveAll(); Audio_.purchase();
+  const lvl=upLvl(u.id), cost=upCost(u);
+  if(lvl>=u.max || SAVE.coins<cost){ Audio_.buzz(); return; }
+  SAVE.coins-=cost; SAVE.upgrades[u.id]=lvl+1; saveAll(); Audio_.purchase();
 }
 
 function drawMilestone(){
@@ -2339,12 +2445,40 @@ function drawSettings(){
 function drawEncyclopedia(T){
   text('ENCYCLOPEDIA', CONFIG.W/2, T+38, '#F5C518', 15);
   const viewTop=T+60, viewBot=CONFIG.H-64, viewH=viewBot-viewTop;
-  const ch=24+16 + POWERUP_GUIDE.length*(66+10) + 44 + BUFFS.length*(60+8);
+  const coinsH = 40 + COIN_GUIDE.length*(52+8);
+  const ch=coinsH + 24+16 + POWERUP_GUIDE.length*(66+10) + 44 + BUFFS.length*(60+8);
   const maxScroll=Math.max(0, ch-viewH);
   settingsScroll = Math.max(0, Math.min(maxScroll, settingsScroll));
   ctx.save();
   roundRect(18,viewTop-4,CONFIG.W-36,viewH+8,10); ctx.clip();
   let y=viewTop - settingsScroll;
+  // ---- COINS ----
+  text('COINS', CONFIG.W/2, y+8, '#F5C518', 10);
+  text('PICK THESE UP TO BUILD YOUR COIN TOTAL', CONFIG.W/2, y+24, '#777', 6); y+=40;
+  const luckLvl=upLvl('luckyFind'), luck=Math.pow(1.5, luckLvl);
+  for(const c of COIN_GUIDE){
+    const h=52;
+    ctx.fillStyle='#140C26'; roundRect(24,y,CONFIG.W-48,h,10); ctx.fill();
+    pixelBorder(24,y,CONFIG.W-48,h,'#2A2040',3);
+    ctx.fillStyle='#0B0620'; roundRect(34,y+6,40,40,8); ctx.fill();
+    pixelBorder(34,y+6,40,40,'#3A2F55',2);
+    drawCoin(54, y+26, 12, c.kind);
+    text(c.name, 86, y+17, '#fff', 8, 'left');
+    text('WORTH '+c.worth, CONFIG.W-40, y+17, '#F5C518', 8, 'right');
+    let chance;
+    if(c.kind==='normal'){
+      const other=(CONFIG.RARE_CHANCE+CONFIG.ULTRA_CHANCE)*luck;
+      chance='Common — about '+((1-other)*100).toFixed(0)+'% of coins';
+    } else {
+      const base = c.kind==='ultra'?CONFIG.ULTRA_CHANCE:CONFIG.RARE_CHANCE;
+      const total=base*luck, boost=total-base;
+      chance=(total*100).toFixed(1)+'% of coins';
+      if(luckLvl>0) chance += '  (+'+(boost*100).toFixed(1)+'% from Lucky Find)';
+    }
+    text(chance, 86, y+35, '#9aa', 6, 'left');
+    y+=h+8;
+  }
+  // ---- POWER-UPS ----
   text('POWER-UPS', CONFIG.W/2, y+8, '#5BC8F5', 10);
   text('These are temporary buffs that appear at random', CONFIG.W/2, y+24, '#777', 6); y+=40;
   for(const [type,name,desc] of POWERUP_GUIDE){
