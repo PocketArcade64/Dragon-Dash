@@ -98,15 +98,16 @@ function saveAll(){
   localStorage.setItem(LS.unlocked, JSON.stringify(SAVE.unlocked));
 }
 
-// ---- Upgrades definition ----
+// ---- Upgrades definition (all PERMANENT) ----
+// icon: {src:'icon'|'heart'|'shop', key} — which image set to pull the artwork from
 const UPGRADES = [
-  {id:'extraHeart', name:'EXTRA HEART', desc:'+1 starting HP (max 3 total)', cost:30, max:2},
-  {id:'coinMagnet', name:'COIN MAGNET', desc:'Small passive coin attraction', cost:25, max:1},
-  {id:'luckyFind',  name:'LUCKY FIND',  desc:'Power-up spawn rate +25%', cost:35, max:2},
-  {id:'piggyBank',  name:'PIGGY BANK',  desc:'Each coin collected counts x2', cost:40, max:1},
-  {id:'forgivingGap',name:'FORGIVING GAP',desc:'Hitbox 15% smaller', cost:50, max:1},
-  {id:'secondWind', name:'SECOND WIND', desc:'Once/run survive a lethal hit', cost:60, max:1},
-  {id:'highBonus',  name:'HIGH SCORE BONUS', desc:'+5 coins when you beat your best', cost:45, max:1},
+  {id:'extraHeart', name:'EXTRA HEART', desc:'+1 starting HP (max 3 total)', cost:30, max:2, icon:{src:'heart',key:'full'}},
+  {id:'coinMagnet', name:'COIN MAGNET', desc:'Small passive coin attraction', cost:25, max:1, icon:{src:'icon',key:'magnet'}},
+  {id:'luckyFind',  name:'LUCKY FIND',  desc:'Power-up spawn rate +25%', cost:35, max:2, icon:{src:'shop',key:'clover'}},
+  {id:'piggyBank',  name:'PIGGY BANK',  desc:'Each coin collected counts x2', cost:40, max:1, icon:{src:'shop',key:'piggy'}},
+  {id:'forgivingGap',name:'FORGIVING GAP',desc:'Hitbox 15% smaller', cost:50, max:1, icon:{src:'icon',key:'tiny'}},
+  {id:'secondWind', name:'PHOENIX UP', desc:'Once/run survive a lethal hit', cost:60, max:1, icon:{src:'shop',key:'phoenix'}},
+  {id:'highBonus',  name:'HIGH SCORE BONUS', desc:'+5 coins when you achieve a top 3 highscore', cost:45, max:1, icon:{src:'shop',key:'trophy'}},
 ];
 function upLvl(id){ return SAVE.upgrades[id]||0; }
 
@@ -375,6 +376,7 @@ let fxParticles = [];   // effect particles
 let shake = 0;
 let flash = 0;          // red hit flash alpha
 let buffChoices = [];
+let milestoneSelected = null;   // buff tentatively chosen on the milestone screen (awaiting confirm)
 let pendingNewRank = -1;
 let nameEntry = '';
 let pointer = {x:0,y:0};
@@ -534,9 +536,11 @@ function update(){
     // scoring
     if(!o.scored && o.x + o.w/2 < G.x){
       o.scored = true;
-      // DOUBLE POINTS: each obstacle passed counts for 2 score (does NOT affect coins)
-      G.score += (G.timers.doublePoints>0) ? 2 : 1;
-      G.obstPassed++;           // raw obstacles cleared this run — drives biome progression
+      // DOUBLE POINTS: each obstacle passed counts for 2 — toward score AND area progression,
+      // so areas transition sooner while it's active. Coins are unaffected.
+      const pts = (G.timers.doublePoints>0) ? 2 : 1;
+      G.score += pts;
+      G.obstPassed += pts;      // drives biome progression — doubled during Double Points
       Audio_.scoreTick();
       onObstacleCleared(o);
     }
@@ -578,14 +582,14 @@ function update(){
   // timers tick (frames)
   for(const k in G.timers){ if(G.timers[k]>0) G.timers[k]--; }
 
-  // milestone check — every BIOME_LEN obstacles passed (independent of score, so
-  // Double Points' score bonus never shifts when the area transitions)
-  if(!G.pendingMilestone && G.obstPassed >= G.nextBiomeAt){
+  // Begin the area transition 5 obstacles BEFORE the boundary so the new area has fully
+  // crossfaded in right around the boundary (e.g. clearly in by ~76, not ~80).
+  if(!G.pendingMilestone && G.obstPassed >= G.nextBiomeAt - 5){
     beginTransition();
   }
   // crossfade transition
   if(G.transition>0 && G.transition<1){
-    G.transition += 0.012;
+    G.transition += 0.02;   // ~50 frames to fully reveal the new area
     if(G.transition>=1){
       G.transition=1; G.biome=G.transTarget; Audio_.setBiome(G.biome);
       if(!SAVE.unlocked[G.biome]){ SAVE.unlocked[G.biome]=true; saveAll(); }
@@ -649,7 +653,7 @@ function takeDamage(){
   if(G.hearts>1){ G.hearts--; Audio_.hit(); return; }
   // at 1 heart
   if(upLvl('secondWind')>0 && !G.secondWindUsed){
-    G.secondWindUsed=true; Audio_.shield(); spawnText('SECOND WIND',G.x,G.y-44,'#F5C518'); explode(G.x,G.y,'#F5C518',20); return;
+    G.secondWindUsed=true; Audio_.shield(); spawnText('PHOENIX UP',G.x,G.y-44,'#F5C518'); explode(G.x,G.y,'#F5C518',20); return;
   }
   G.hearts--; doDeath();
 }
@@ -694,6 +698,23 @@ function collectCoin(c){
   else if(c.kind==='rare'){ Audio_.coin5(); explode(c.x,c.y,'#FFE680',7); }
   else Audio_.coin1();
 }
+// Return a y for a coin at world-x `cx` that the dragon can actually reach:
+// if any obstacle column spans cx, place the coin inside that obstacle's gap (with margin);
+// otherwise keep it in the central playable band.
+function safeCoinY(cx){
+  const COIN_R = CONFIG.COIN_R||10;
+  for(const o of G.obstacles){
+    const halfW = o.w/2 + COIN_R + 6;            // column footprint plus coin radius + margin
+    if(cx > o.x-halfW && cx < o.x+halfW){
+      const margin = Math.min(o.gap*0.5 - COIN_R - 4, o.gap*0.35);
+      const m = Math.max(0, margin);
+      return clamp(o.gapY + rnd(-m, m), CONFIG.HUD_H+COIN_R+8, CONFIG.H-COIN_R-8);
+    }
+  }
+  // no obstacle here — central band, biased toward the dragon's current height
+  const base = (G.y!=null) ? G.y : (CONFIG.HUD_H + (CONFIG.H-CONFIG.HUD_H)/2);
+  return clamp(base + rnd(-90,90), CONFIG.HUD_H+60, CONFIG.H-60);
+}
 function collectPowerup(p){
   p.dead=true; Audio_.powerup(); explode(p.x,p.y,'#fff',10);
   switch(p.type){
@@ -704,7 +725,12 @@ function collectPowerup(p){
     case 'slowfield': G.timers.slowField = 12*60; break;
     case 'doublepoints': G.timers.doublePoints = 20*60; break;
     case 'coinburst':
-      for(let i=0;i<5;i++) G.coins.push({x:CONFIG.W+40+i*30,y:rnd(CONFIG.HUD_H+60,CONFIG.H-60),val:1,kind:'normal',dead:false});
+      // spawn 5 coins ahead, each placed in a reachable spot: if a coin's x falls inside
+      // an obstacle column, put it inside that obstacle's gap so it's never trapped behind rock.
+      for(let i=0;i<5;i++){
+        const cx = CONFIG.W+40+i*30;
+        G.coins.push({x:cx, y:safeCoinY(cx), val:1, kind:'normal', dead:false});
+      }
       break;
   }
   spawnText(p.type.toUpperCase(),G.x,G.y-44,'#9FE');
@@ -730,6 +756,7 @@ function openMilestone(){
     weighted=weighted.filter(x=>x.id!==b.id);
   }
   Audio_.gong();
+  milestoneSelected=null;
   state='milestone';
 }
 function applyBuff(b){
@@ -750,6 +777,8 @@ function applyBuff(b){
   }
   G.pendingMilestone=false;
   Audio_.startMusic();
+  // resume with a 3-2-1 countdown so play doesn't instantly start under the player's tap
+  G.countdown=180; G.countdownLabel='GET READY';
   state='playing';
 }
 
@@ -758,19 +787,19 @@ function applyBuff(b){
 // ============================================================
 function endRun(){
   shake=0;
+  // determine whether this run lands a top-3 leaderboard (high)score
+  const board = SAVE.board.slice();
+  const topThree = G.score>0 && (board.length<3 || G.score > board[board.length-1].score);
   // coins -> persistent
   let earned = G.runCoins;
-  const beatBest = G.score > SAVE.high;
-  if(beatBest && upLvl('highBonus')>0) earned += 5;
+  if(topThree && upLvl('highBonus')>0) earned += 5;   // +5 for a top-3 highscore
   G.finalEarned = earned;
   G.oldTotal = SAVE.coins;
   SAVE.coins += earned;
   if(G.score > SAVE.high) SAVE.high = G.score;
   // leaderboard rank
   pendingNewRank = -1;
-  const board = SAVE.board.slice();
-  const wouldRank = board.length<3 || G.score > board[board.length-1].score;
-  if(wouldRank && G.score>0){
+  if(topThree){
     let rank=0; while(rank<board.length && G.score<=board[rank].score) rank++;
     pendingNewRank = rank; // 0-based
   }
@@ -831,7 +860,7 @@ function spawnAmbient(){
 // ============================================================
 function jump(){
   Audio_.init(); Audio_.resume();
-  if(state==='playing' && !G.dead){
+  if(state==='playing' && !G.dead && G.countdown<=0){
     G.vy = CONFIG.JUMP_V; G.flapFrame=0; G.flapTimer=0; Audio_.jump();
   }
 }
@@ -855,14 +884,14 @@ function onPointerDown(e){
   e.preventDefault();
   Audio_.init(); Audio_.resume();
   const p=canvasPos(e); pointer=p;
-  if(state==='settings'){ dragActive=true; dragLastY=p.y; dragMoved=0; }
+  if(state==='settings' || state==='shop'){ dragActive=true; dragLastY=p.y; dragMoved=0; }
   if(state==='playing'){ if(!hitTest(p)) jump(); return; }
   if(state==='select' && p.y>=CARD_Y-6 && p.y<=CARD_Y+CARD_H+6){
     // begin horizontal carousel drag
     carDrag=true; carDragStartX=p.x; carDragStartScroll=carScroll; carDragMoved=0;
     pendingTap=p; return;
   }
-  if(state==='settings'){ pendingTap=p; return; }  // decide tap vs drag on release
+  if(state==='settings' || state==='shop'){ pendingTap=p; return; }  // decide tap vs drag on release
   hitTest(p);
 }
 function onPointerMove(e){
@@ -872,10 +901,12 @@ function onPointerMove(e){
     const dx=carDragStartX-wx; carScroll=carDragStartScroll+dx; carDragMoved+=Math.abs(wx-(pointer.x));
     pointer.x=wx; e.preventDefault(); return;
   }
-  if(!dragActive || state!=='settings') return;
+  if(!dragActive || (state!=='settings' && state!=='shop')) return;
   const cy=(e.touches?e.touches[0].clientY:e.clientY);
   const r=cv.getBoundingClientRect(); const wy=(cy-r.top)*(CONFIG.H/r.height);
-  const dy=dragLastY-wy; settingsScroll+=dy; dragLastY=wy; dragMoved+=Math.abs(dy);
+  const dy=dragLastY-wy;
+  if(state==='shop') shopScroll+=dy; else settingsScroll+=dy;
+  dragLastY=wy; dragMoved+=Math.abs(dy);
   e.preventDefault();
 }
 function onPointerUp(){
@@ -885,7 +916,7 @@ function onPointerUp(){
     else { carIndex = clamp(Math.round(carScroll/stride), 0, CAROUSEL.length-1); }  // snap
     carDrag=false; pendingTap=null; return;
   }
-  if(state==='settings' && pendingTap && dragMoved<6){ hitTest(pendingTap); }
+  if((state==='settings'||state==='shop') && pendingTap && dragMoved<6){ hitTest(pendingTap); }
   pendingTap=null; dragActive=false;
 }
 let pendingTap=null;
@@ -895,7 +926,7 @@ window.addEventListener('mousemove', onPointerMove);
 window.addEventListener('touchmove', onPointerMove, {passive:false});
 window.addEventListener('mouseup', onPointerUp);
 window.addEventListener('touchend', onPointerUp);
-window.addEventListener('wheel', e=>{ if(state==='settings'){ settingsScroll+=e.deltaY; } }, {passive:true});
+window.addEventListener('wheel', e=>{ if(state==='settings'){ settingsScroll+=e.deltaY; } else if(state==='shop'){ shopScroll+=e.deltaY; } }, {passive:true});
 window.addEventListener('keydown', e=>{
   if(e.code==='Space'){ e.preventDefault();
     if(state==='playing') jump();
@@ -932,13 +963,54 @@ function text(str,x,y,color,px,align='center'){
 function button(label,x,y,w,h,bg,fg,fn,opts={}){
   buttons.push({x,y,w,h,fn});
   ctx.fillStyle = bg; roundRect(x,y,w,h,opts.r||8); ctx.fill();
-  if(opts.border){ ctx.strokeStyle=opts.border; ctx.lineWidth=2; roundRect(x,y,w,h,opts.r||8); ctx.stroke(); }
-  text(label, x+w/2, y+h/2+1, fg, opts.fs||12);
+  // pixel-art border on every button (selectable box)
+  if(opts.noPixelBorder){ if(opts.border){ ctx.strokeStyle=opts.border; ctx.lineWidth=2; roundRect(x,y,w,h,opts.r||8); ctx.stroke(); } }
+  else { pixelBorder(x,y,w,h, opts.border||shade(bg,1.35), opts.bp||3); }
+  textCentered(label, x+w/2, y+h/2, fg, opts.fs||12);
+}
+// Draw text centered on (cx,cy) using the glyphs' true vertical extent so pixel-font labels
+// sit dead-center in a box (fixes Silkscreen's baseline sitting slightly high/low).
+function textCentered(str,cx,cy,color,px){
+  setFont(px); ctx.fillStyle=color; ctx.textAlign='center';
+  const m=ctx.measureText(str);
+  if(m.actualBoundingBoxAscent!=null && m.actualBoundingBoxDescent!=null){
+    ctx.textBaseline='alphabetic';
+    const yy = cy + (m.actualBoundingBoxAscent - m.actualBoundingBoxDescent)/2;
+    ctx.fillText(str,cx,yy);
+  } else {
+    ctx.textBaseline='middle'; ctx.fillText(str,cx,cy);
+  }
+}
+// lighten a hex color by `f` for a pixel-border highlight
+function shade(hex,f){
+  if(typeof hex!=='string'||hex[0]!=='#'||hex.length<7) return '#ffffff';
+  let r=Math.min(255,Math.round(parseInt(hex.slice(1,3),16)*f));
+  let g=Math.min(255,Math.round(parseInt(hex.slice(3,5),16)*f));
+  let b=Math.min(255,Math.round(parseInt(hex.slice(5,7),16)*f));
+  return '#'+[r,g,b].map(v=>v.toString(16).padStart(2,'0')).join('');
 }
 function roundRect(x,y,w,h,r){
   ctx.beginPath();
   ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
   ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
+}
+// Chunky pixel-art border around a box: a stepped outline with notched corners so it reads
+// as blocky pixel art rather than a smooth stroke. p = pixel size (border thickness).
+function pixelBorder(x,y,w,h,color,p){
+  p = p||3;
+  x=Math.round(x); y=Math.round(y); w=Math.round(w); h=Math.round(h);
+  ctx.fillStyle=color;
+  // top & bottom edges, inset by one pixel-cell at each end for a notched-corner look
+  ctx.fillRect(x+p,       y,        w-2*p, p);
+  ctx.fillRect(x+p,       y+h-p,    w-2*p, p);
+  // left & right edges
+  ctx.fillRect(x,         y+p,      p,     h-2*p);
+  ctx.fillRect(x+w-p,     y+p,      p,     h-2*p);
+  // corner blocks set in by one cell (the "stair-step" pixel corner)
+  ctx.fillRect(x+p,       y+p,      p, p);
+  ctx.fillRect(x+w-2*p,   y+p,      p, p);
+  ctx.fillRect(x+p,       y+h-2*p,  p, p);
+  ctx.fillRect(x+w-2*p,   y+h-2*p,  p, p);
 }
 const HEART=[
  [0,1,1,0,0,1,1,0],
@@ -973,6 +1045,19 @@ function drawCoin(x,y,r,kind){
     ctx.fillStyle='#C99A0B'; ctx.beginPath(); ctx.arc(x,y,r*0.62,0,7); ctx.fill();
   }
   ctx.restore();
+}
+// Draw a right-aligned "[coin] 1234" counter whose right edge sits at rightX, vertically centered at y.
+// Measures the actual text width so 1-4 digit values never clip into the coin icon.
+function drawCoinCounter(rightX, y, value, fontPx, coinR, color){
+  const str = ''+value;
+  setFont(fontPx);
+  const tw = ctx.measureText(str).width;
+  // number, right-aligned at rightX
+  text(str, rightX, y, color||'#F5C518', fontPx, 'right');
+  // coin icon sits a fixed gap to the LEFT of the number's left edge
+  const coinD = coinR*2.2, gap = 6;
+  const coinCx = rightX - tw - gap - coinD/2;
+  drawCoin(coinCx, y, coinR, 'normal');
 }
 function drawDragonSprite(x,y,scale,frame,rot,alpha,tint){
   const s=SPRITES[G?.dragon?.key||SAVE.dragon];
@@ -1416,6 +1501,10 @@ function drawBuffIcon(id,cx,cy,size,fallbackColor){
 const MOON_B64="iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAAAwElEQVR42tVVQQ6EIAykxkQ/4j5B/3/EJ+BH8DR7WQghFbpdJG6PQKczLTBkZIGLdaolkgTYOs9ubq+5ijFKgNdlihv7cabgqoB1HtZ55GGdx6c4fgLnIgE3jwIfagf24xQNU8W+RVsG0yFuY99Fwd8WiO29LLAuU/gqoJhp31vU8hUjYIWcsTHJ4jcuUcGpQZqbKxYpSAYeGEYAzjNUs8gVcZ7BzYtKvZSyylyOJJ4MiXzGPukO0y/i0Bf3W5X/BkMbUjJWT0aUAAAAAElFTkSuQmCC";
 const MOON_IMG=new Image(); const MOON_REC={img:MOON_IMG,ready:false};
 MOON_IMG.onload=()=>{ MOON_REC.ready=true; }; MOON_IMG.src='data:image/png;base64,'+MOON_B64;
+// settings gear icon
+const SETTINGS_B64="iVBORw0KGgoAAAANSUhEUgAAADUAAAA1CAYAAADh5qNwAAADt0lEQVR42t2avU4bQRDHZ89+AiTM8QIoFQUtUgoKilgKTZAQlSMQSkNshcaGOkAT5CQNsohwhSI5DZGcgiJFJLcpUuYFOA6JN0CbJmPtbfZj9uPA8UgnGd8xs7/9783ODjAoyRircNN9zu9ZWbGrUKINr0bK7+ury2WGhQSm0EpVamlxYfqgPvS/Fn7OsvxBoJKYLz9jFY6X6n6a1sjPUmMGKcVYhV9ntzCfznI5c2FgMTHokgGCSc9yVUY0xQxWirEKx0EMr0aF2cN7ukxHzZI6v6qY1vG6AC0tLsDPX78LSogwYmKQ3yfZXjeejz+jT5VfOSZFMeYCtH98Boft7cIgRBgbiA1Q5VeOSQFjLkBoYpClxQVvGBWc6FcX0wZmhRIHnWU5pGkNsiyHw/Z2kDo21VTbAYIFQV1nt9EHHWIINp/OGqESl83zsS1Na6QxJaYq+qi9NXF13VF7y5ooEtvxYJLAKEDklO6a4bIsh/Nux/jMy9ZRoWyiZkZKSq/GfpERxhb4vNvhPnBBFYWrSgjkeqJlrMKpYFS1oqR0XyBfsKCU7rLkQnoOnN+z824n2nmL6c4sFJViAPkohmrpmjlVVZOE2hiJCSQoxjvHn5wbO+KYk5BlV2Y5FBKTiUlBtP3jM+MyoG6EvstQVAthcDxiQY0mJo+qCDGJplPHNN7/pu8nqhTUo3iolpYNxrXiGEPd5TcTqxJOrm6S5bEnppsmh64dHpckoepMUYGUy88ENknqmFbXOPtdXnT/ORqoAmGPAuAJrG224PKiy2NWFGubLdJkmo42Ce7k8qX7JQzU6w9gp7EOK/WNKMuQsQpfqW/ATmMdev0BqZKRr+CUPlObG38OBUMglW8fC9qnev0B7DV3C2BO7eG/zyPQXnMXvnz7Ud4hUayaTXaX38BOYx3evf84/u778LPx9Ivgojp7zV3o9QdWlShFdHBFMVObKyiGgxWVky+87woURSmqWjrFKOYCRD3qkLtJ1IL3xbOnAABWOFSWCkRtORu7Sbqd3Wb4oovLUZdkZmpzzktueDWC+uoyD/4Dwas3b6OkWl/DyuH05CBONwmBYu0hvkBopycH1m4So5YsjwGmq+0uL7p+LTLO75lcDz7kMcUXiJzSVYoh8NpmK5pyd/lNwa8PEGnzVSmGzvFeDOUQSPTrA0RSSlZM5RzLHpxdqnI4GQig8quLGQUKgxizjlDMmpaluMxMNSIlZjCUz4FPBhOXWVmxq4+Vxcq0qfx/v6mEKvWdsm0VZcX+A0m4+54imf98AAAAAElFTkSuQmCC";
+const SETTINGS_IMG=new Image(); const SETTINGS_REC={img:SETTINGS_IMG,ready:false};
+SETTINGS_IMG.onload=()=>{ SETTINGS_REC.ready=true; }; SETTINGS_IMG.src='data:image/png;base64,'+SETTINGS_B64;
 // heart images (HUD): full / empty / temp(yellow), drawn at native 11x10 aspect
 const HEART_B64={
   full:"iVBORw0KGgoAAAANSUhEUgAAAAsAAAAKCAYAAABi8KSDAAAAYElEQVR42n2QsQ3AIBAD71mDBWjZfwhaFkjWcJoQQeJwpf8svQw3AQoQEy4jQGctOmt5jjYL0FHLUs6t47KE4S0OrPxHEkRufSvl1hFEAtgVhri84QqzaBmTffbdFVx+ASGDLwzdcmJ5AAAAAElFTkSuQmCC",
@@ -1432,6 +1521,30 @@ function drawHeartImg(kind, x, y, dispW){
     ctx.fillStyle = kind==='empty'?'#444':(kind==='temp'?'#F5C518':'#E74C3C');
     ctx.fillRect(Math.round(x),Math.round(y),Math.round(dispW),Math.round(dispW*10/11));
   }
+}
+// shop upgrade icons (clover / trophy / piggy / phoenix)
+const SHOP_B64={
+  clover:"iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAABvElEQVR42rVWu2rDQBCcOwQpQmJIHEhQYVIEHBdSoz9xK9C3GdSafIjd2IUxpFJhjMEJyMFFQjilUFZa3cOSCx8IdKvb2buZ0UrAhYdoWxAkoqD75aQQfE6xU/leG3gYSxZR2ryMnSritYH3BgoAsJpK8DkA5JlspUheWgNngeWkEItUORO77L7TCU4BLVLVKrKwuYW7gwu9mQN+ZILruTzfs7uldEe9sOkeAidgM7d2l8fBuUPqJLKhKvpD2QDnwC53OQmmhDCWCBLR8Dq3MF3O98BGAS+SZ/L/NKpBB4He4QWfeHcaQgSJKPrD8sForOB93+D36gt5JrGZNxf7EYyYbezXqikyJa6mEsCxYu759QGzt11FFYHv1zV994/XRoGP6FiLTMHRWBn+n6U7o8H5EbBfA7dPpeBhfLRo0CJynpluod33BgphLHHYqqpInsmKf12HSmTNw9bWTC8Z0bNI6yLcALzFiHO6qR/V7qGdUhEAOGyV8Y04q5tyrvk9AZMbOzc7XTxX41tOCnHYKvzkZZEgEQXR2+kEeSYrK3ctQoVkGzAHJP9TXG/XvEinj76thes/AV3yLjr+AOvmLT8SWpFyAAAAAElFTkSuQmCC",
+  trophy:"iVBORw0KGgoAAAANSUhEUgAAAB8AAAAfCAYAAAAfrhY5AAABLklEQVR42t2VzQ3CMAyF7agLlRV66FIghGApDl0hHaQ7YA4QSI2TxvkBiUi99Cffe36ugxBeBHUWhh50sa/IFlJ3maq+4RxjsBLntACYMc50ZScOWpWsJ4AZ80R87ktOQOeDtzIqzZ3s43ICDHsJvQsqZo4AgNycSd6ip+pVicHfSpV5e82GSfBn7vXteZp48xkpC3HNWLMB8aPsm+4TcqclzbUPD7lf3090H8rbdy02XEn2Gtcc/nLJBKBm+DDXfIBh7FeTBFCGa9oCx/5DcdaHyufAZhRneZCjOVJREuWD3Ts5R6p6WAjgauM1OnZLwdkfaUpbG05k192d6/6nzg3k0i3A7druPG++sLDcRft1WrWH/Um8f74cmzinVlVNcj4Mg4o6TdN/NFyzst8BeARyG7X6h1sAAAAASUVORK5CYII=",
+  piggy:"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",
+  phoenix:"iVBORw0KGgoAAAANSUhEUgAAADcAAAA3CAYAAACo29JGAAADMElEQVR42u2av2siURDH55lAErS44KURROVEhO3SWKW6InB/QDjSXJnO6mpP/BPSpUwjR7o0B1dYpbKxCYJIjlwQ0iTBKwxnCnlXHCOz47z9Iauu8r7V+lzY/ez3O/NmRQArKysrK6v1VjXj6GrG0RZsnXRRKuuNckqC4u7FFtp0YxelshhBr2huxw3srN9Tpu/PH7vK5JaXk7F0ze8mJdfomlqnWkPnOBCu48NB99U6QAUBk5RY9U2bvvOKm5OagJOa+F4nsQowU2MwQVMQPO6Otny7rIp7XXGHKJRXJGOzFUgRlM5DMD+opcYyyMSAdeTX/k2NRdrkE3FxywR8Uv/rcg0bC3evO9qacTSxDNf41OHVRLDGEOyqvudy1tQlpagmFh1DE9j5Y1fRplEsjKFYGItg1B3eJb2kluEUB3NSk+lNohPFwhju7ncBAFxgCHx9mwzcJSPplq3jvP7483eoB0Rjh0IACez6NinCSHUXmXN8jgviotQ1KdjhFw1X9T3XGncsyHUjcc50AWm6x6dM48fBOpfKCOV3zUidGzZzev/0QQVpJtWMo2ltcZUqT9BvHwAAwN39rtjW55GKupngzd/d78JZvzeNEa6XKk/T8/vtAxcYhfPavJc6obSO87p1nNd+sFQIRsXPkWIZxtHtKGPJI4efuWscjLoXpqYWEsthM6dHvWfINl4VOsbjxtekdR7HeYbjSOGGzZwGABj1nmdcSJXfT9fpsQmKx9ALjL8SLXwTxxY+6v2HQSgvB/vtA7G2TGCDWlL/+J4FgEnoyKqw9YXOeQknjE+fB2IsaTdd5NCuwkRx//RB4bGqpEG3X0QofE3B+NIY0k18no05jALFkoKoShoAwAUmQVEwCrMssFA1pyppGDZBcyAJioLRwTrMXLiUWP75dah1+2XqWO3oDQAAGjc7M7GkXZTXmPT24PfzeaRwvHFgHL99TU3PadzszMQS6zHI69CwmdOdS7WahkKdoi6hEIrDDGpJnW28xuoXbMXB8Lh29OaCeveho4K8FcRJrsEZATiYVFtxBxObRzXjaHQwyIa9FtrofwXAJmpjwaysrKysrAD+AeVaVVGZmCO3AAAAAElFTkSuQmCC",
+};
+const SHOP_ICONS={};
+for(const k in SHOP_B64){ const im=new Image(); const rec={img:im,ready:false}; im.onload=()=>{rec.ready=true;}; im.src='data:image/png;base64,'+SHOP_B64[k]; SHOP_ICONS[k]=rec; }
+// draw an upgrade's icon (from any image set) centered at (cx,cy) within a square of `size`
+function drawUpgradeIcon(icon, cx, cy, size){
+  if(!icon){ return; }
+  if(icon.src==='heart'){
+    // hearts keep native aspect; place centered
+    const rec=HEART_IMGS[icon.key];
+    const w=size, h=rec&&rec.ready?Math.round(size*rec.h/rec.w):Math.round(size*10/11);
+    drawHeartImg(icon.key, cx-w/2, cy-h/2, w);
+    return;
+  }
+  const set = icon.src==='shop' ? SHOP_ICONS : ICONS;
+  const rec = set[icon.key];
+  if(rec && rec.ready){ ctx.drawImage(rec.img, Math.round(cx-size/2), Math.round(cy-size/2), Math.round(size), Math.round(size)); }
+  else { ctx.fillStyle='#9aa3b8'; ctx.beginPath(); ctx.arc(cx,cy,size*0.4,0,7); ctx.fill(); }
 }
 
 // shared power-up color map (used by floating power-ups and the HUD timer bars)
@@ -1453,16 +1566,25 @@ function star(cx,cy,r,n){
 
 function drawHUD(){
   const t=SAFE_TOP;
-  // hearts (top-left, below the island)
-  let hx=8; const HW=18, GAP=4;   // heart display width + gap
-  for(let i=0;i<G.maxHearts;i++){ drawHeartImg(i>=G.hearts?'empty':'full', hx, t+8, HW); hx+=HW+GAP; }
-  for(let i=0;i<G.tempHearts;i++){ drawHeartImg('temp', hx, t+8, HW); hx+=HW+GAP; }
+  // hearts (top-left, below the island) — bigger, evenly spaced, and guaranteed to fit
+  // the left HUD zone even with the max base hearts (3) plus bonus/temp hearts.
+  const total = G.maxHearts + G.tempHearts;
+  const HW = 22;                 // heart display width (bigger)
+  const ZONE_X = 10;             // left margin
+  const ZONE_W = CONFIG.W/2 - 34 - ZONE_X;   // room before the centered SCORE text
+  // even step: prefer HW + 6 gap, but compress if the row would exceed the zone
+  let step = HW + 6;
+  if(total > 1 && total*HW + (total-1)*6 > ZONE_W){
+    step = (ZONE_W - HW) / (total - 1);       // distribute evenly across the zone
+  }
+  let hx = ZONE_X;
+  for(let i=0;i<G.maxHearts;i++){ drawHeartImg(i>=G.hearts?'empty':'full', hx, t+6, HW); hx+=step; }
+  for(let i=0;i<G.tempHearts;i++){ drawHeartImg('temp', hx, t+6, HW); hx+=step; }
   // score (center) + best (under it)
   text('SCORE '+G.score, CONFIG.W/2, t+16, '#fff', 11);
   text('BEST '+SAVE.high, CONFIG.W/2, t+38, '#888', 7);
-  // run coins (right, just left of the pause button)
-  drawCoin(CONFIG.W-98, t+14, 7, 'normal');
-  text(G.runCoins, CONFIG.W-86, t+14, '#F5C518', 10, 'left');
+  // run coins (right, just left of the pause button) — aligned with the SCORE text baseline
+  drawCoinCounter(CONFIG.W-46, t+16, G.runCoins, 11, 7, '#F5C518');
   // pause button (far top-right)
   if(!G.dead) pauseButton(CONFIG.W-22, t+18);
   // active timed power-up indicators (below the HUD bar): icon + full name + colored progress bar
@@ -1473,7 +1595,7 @@ function drawHUD(){
     ['magnet','magnet','MAGNET',15],
     ['tiny','tiny','TINY',20],
     ['slowField','slowfield','SLOW FIELD',12],
-    ['doublePoints','doublepoints','DOUBLE POINTS',20],
+    ['doublePoints','doublepoints','DOUBLE SCORE',20],
   ];
   for(const [tkey,ikey,label,max] of tlist){ const t2=G.timers[tkey]; if(t2>0){
     const col=POWERUP_COLORS[ikey]||'#5BC8F5';
@@ -1559,22 +1681,19 @@ function drawSelect(){
   drawLogo(CONFIG.W/2, LOGO_TOP, LOGO_W);
   // stats row: HIGHSCORE on the left, coin total on the right (moved below the taller logo)
   text('HIGHSCORE: '+SAVE.high, 20, 250, '#888', 10, 'left');
-  text(SAVE.coins, CONFIG.W-20, 250, '#F5C518', 12, 'right');
-  drawCoin(CONFIG.W-20-(''+SAVE.coins).length*9-16, 250, 9, 'normal');
+  drawCoinCounter(CONFIG.W-20, 250, SAVE.coins, 12, 9, '#F5C518');
   text('CHOOSE YOUR DRAGON', CONFIG.W/2, 280, '#888', 9);
 
   drawDragonCarousel();
 
-  // FLY button -> choose starting environment
+  // FLY / SHOP — evenly spaced below the carousel dots (dots sit at ~520), clear of them
   const d=DRAGONS[SAVE.dragon];
-  button('FLY', 30, 520, CONFIG.W-60, 60, d.color, '#fff', ()=>{ Audio_.click(); state='envselect'; }, {fs:20,r:12});
-  // SHOP
-  button('SHOP', 30, 592, CONFIG.W-60, 48, '#3A1A5A', '#F5C518', ()=>{ Audio_.click(); shopScroll=0; state='shop'; }, {fs:14,r:10});
+  button('FLY', 30, 550, CONFIG.W-60, 60, d.color, '#fff', ()=>{ Audio_.click(); state='envselect'; }, {fs:20,r:12});
+  button('SHOP', 30, 634, CONFIG.W-60, 56, '#3A1A5A', '#F5C518', ()=>{ Audio_.click(); shopScroll=0; state='shop'; }, {fs:14,r:10});
 
-  text('TAP TO JUMP · SPACEBAR ON WEB', CONFIG.W/2, 668, '#555', 7);
   // preview dragon flapping
   G.dragon=DRAGONS[SAVE.dragon];
-  drawDragonSprite(CONFIG.W/2, 730, 1.6, Math.floor(performance.now()/130)%3, 0, 1, null);
+  drawDragonSprite(CONFIG.W/2, 752, 1.6, Math.floor(performance.now()/130)%3, 0, 1, null);
   // settings gear (top-right of the column)
   gearButton(CONFIG.W-34, SAFE_TOP+30, ()=>{ Audio_.click(); settingsReturn='select'; settingsView='main'; settingsScroll=0; state='settings'; });
 }
@@ -1588,6 +1707,17 @@ function carouselInit(){
   // center the currently-selected dragon on entry
   const i = CAROUSEL.indexOf(SAVE.dragon); if(i>=0) carIndex=i;
   carScroll = carIndex*(CARD_W+CARD_GAP);
+}
+// a small filled pixel-art circle (blocky, no anti-aliasing) centered at (cx,cy).
+// r = radius in grid cells, px = size of each cell in screen pixels.
+function pixelDot(cx,cy,r,color,px){
+  px = px||2;
+  ctx.fillStyle=color;
+  for(let gy=-r;gy<=r;gy++){
+    for(let gx=-r;gx<=r;gx++){
+      if(gx*gx+gy*gy <= r*r + r*0.4){ ctx.fillRect(Math.round(cx+gx*px), Math.round(cy+gy*px), px, px); }
+    }
+  }
 }
 function drawDragonCarousel(){
   const stride = CARD_W+CARD_GAP;
@@ -1608,10 +1738,9 @@ function drawDragonCarousel(){
   // left / right arrows
   if(carIndex>0) arrowButton(20, CARD_Y+CARD_H/2, false, ()=>{ carIndex--; Audio_.click(); });
   if(carIndex<CAROUSEL.length-1) arrowButton(CONFIG.W-20, CARD_Y+CARD_H/2, true, ()=>{ carIndex++; Audio_.click(); });
-  // dots
-  const dotY = CARD_Y+CARD_H+14, dn=CAROUSEL.length, dw=14;
-  for(let i=0;i<dn;i++){ ctx.fillStyle = i===carIndex?'#F5C518':'#3A2F55';
-    ctx.beginPath(); ctx.arc(cxCenter-(dn-1)*dw/2+i*dw, dotY, 3.5, 0, 7); ctx.fill(); }
+  // dots (pixel-art circles)
+  const dotY = CARD_Y+CARD_H+20, dn=CAROUSEL.length, dw=22;
+  for(let i=0;i<dn;i++){ pixelDot(Math.round(cxCenter-(dn-1)*dw/2+i*dw), dotY, 3, i===carIndex?'#F5C518':'#3A2F55', 2); }
 }
 function arrowButton(cx,cy,right,fn){
   buttons.push({x:cx-18,y:cy-22,w:36,h:44,fn});
@@ -1628,8 +1757,7 @@ function arrowButton(cx,cy,right,fn){
 }
 function drawComingSoonCard(x,y,w,h){
   ctx.fillStyle='#150D26'; roundRect(x,y,w,h,10); ctx.fill();
-  ctx.lineWidth=3; ctx.setLineDash([8,6]); ctx.strokeStyle='#3A2F55';
-  roundRect(x,y,w,h,10); ctx.stroke(); ctx.setLineDash([]);
+  pixelBorder(x,y,w,h,'#3A2F55',3);
   // big question mark / egg motif
   ctx.save();
   ctx.translate(x+w/2, y+72);
@@ -1697,7 +1825,7 @@ function drawEnvSelect(){
     const b=BIOMES[i], unlocked=!!SAVE.unlocked[i];
     ctx.globalAlpha = unlocked?1:0.5;
     ctx.fillStyle='#160E2A'; roundRect(22,y,CONFIG.W-44,cardH,10); ctx.fill();
-    ctx.lineWidth=2; ctx.strokeStyle = unlocked? b.accent : '#2A2040'; roundRect(22,y,CONFIG.W-44,cardH,10); ctx.stroke();
+    pixelBorder(22,y,CONFIG.W-44,cardH, unlocked? b.accent : '#2A2040', 3);
     drawBiomePreview(b, 32, y+12, 96, cardH-24);
     text(b.name, 144, y+30, '#fff', 9, 'left');
     if(unlocked){ text('TAP TO START HERE', 144, y+56, '#3CB371', 7, 'left'); }
@@ -1712,7 +1840,7 @@ function drawEnvSelect(){
 function drawDragonCard(key,x,y,w,h){
   const d=DRAGONS[key]; const sel=SAVE.dragon===key;
   ctx.fillStyle='#1A1030'; roundRect(x,y,w,h,10); ctx.fill();
-  ctx.lineWidth=3; ctx.strokeStyle = sel? d.color : '#2A2040'; roundRect(x,y,w,h,10); ctx.stroke();
+  pixelBorder(x,y,w,h, sel? d.color : '#2A2040', sel?4:3);
   buttons.push({x,y,w,h,fn:()=>{ if(SAVE.dragon!==key){ SAVE.dragon=key; saveAll(); Audio_.click(); } }});
   // sprite
   const prevDragon=G.dragon; G.dragon=d;
@@ -1738,27 +1866,66 @@ let shopScroll=0;
 function drawShop(){
   buttons=[];
   const top=SAFE_TOP;
-  text('SHOP', 20, top+30, '#F5C518', 16, 'left');
-  drawCoin(CONFIG.W-92,top+30,9,'normal'); text(SAVE.coins,CONFIG.W-76,top+30,'#F5C518',12,'left');
-  let y=top+58; const cardH=78;
+  // header
+  text('SHOP', 20, top+26, '#F5C518', 16, 'left');
+  drawCoinCounter(CONFIG.W-20, top+26, SAVE.coins, 12, 9, '#F5C518');
+  text('PERMANENT UPGRADES — KEPT FOREVER', CONFIG.W/2, top+50, '#7FB069', 7);
+
+  // scrollable list viewport
+  const viewTop=top+64, viewBot=CONFIG.H-66, viewH=viewBot-viewTop;
+  const cardH=82, gap=10;
+  const contentH = UPGRADES.length*(cardH+gap);
+  const maxScroll=Math.max(0, contentH-viewH);
+  shopScroll = Math.max(0, Math.min(maxScroll, shopScroll));
+  ctx.save();
+  roundRect(16, viewTop-4, CONFIG.W-32, viewH+8, 10); ctx.clip();
+  let y = viewTop - shopScroll;
   for(const u of UPGRADES){
-    const lvl=upLvl(u.id), maxed=lvl>=u.max, afford=SAVE.coins>=u.cost && !maxed;
-    ctx.fillStyle='#1A1030'; ctx.globalAlpha=maxed?0.6:1; roundRect(20,y,CONFIG.W-40,cardH,10); ctx.fill(); ctx.globalAlpha=1;
-    ctx.lineWidth=2; ctx.strokeStyle=maxed?'#3A6A3A':(afford?'#F5C518':'#2A2040'); roundRect(20,y,CONFIG.W-40,cardH,10); ctx.stroke();
-    text(u.name, 34, y+16, '#fff', 9, 'left');
-    wrapTextLeft(u.desc, 34, y+34, CONFIG.W-150, 12, '#888', 7);
-    text('LV '+lvl+'/'+u.max, 34, y+cardH-12, '#aaa', 7, 'left');
-    if(maxed){ text('MAXED', CONFIG.W-50, y+cardH/2, '#3CB371', 9, 'right'); }
-    else {
-      const bw=78,bh=32,bx=CONFIG.W-40-bw-6,by=y+cardH/2-bh/2;
-      const bg2=afford?'#F5C518':'#332', fg=afford?'#000':'#777';
-      if(afford){ button(u.cost+'🪙', bx,by,bw,bh, bg2, fg, ()=>buy(u), {fs:9,r:8}); }
-      else { ctx.fillStyle=bg2; roundRect(bx,by,bw,bh,8); ctx.fill(); text(u.cost+'🪙',bx+bw/2,by+bh/2,fg,9);
-             buttons.push({x:bx,y:by,w:bw,h:bh,fn:()=>{Audio_.buzz();}}); }
-    }
-    y+=cardH+10;
+    drawUpgradeCard(u, y, cardH);
+    y += cardH+gap;
   }
-  button('BACK', 30, CONFIG.H-66, CONFIG.W-60, 46, '#3A1A5A', '#F5C518', ()=>{ Audio_.click(); state='select'; }, {fs:14,r:10});
+  ctx.restore();
+  // scrollbar
+  if(maxScroll>0){
+    const th=Math.max(28, viewH*viewH/contentH), ty=viewTop + (viewH-th)*(shopScroll/maxScroll);
+    ctx.fillStyle='rgba(255,255,255,0.08)'; roundRect(CONFIG.W-11,viewTop,4,viewH,2); ctx.fill();
+    ctx.fillStyle='rgba(245,197,24,0.55)'; roundRect(CONFIG.W-11,ty,4,th,2); ctx.fill();
+  }
+  button('BACK', 30, CONFIG.H-58, CONFIG.W-60, 44, '#3A1A5A', '#F5C518', ()=>{ Audio_.click(); state='select'; }, {fs:14,r:10});
+}
+function drawUpgradeCard(u, y, cardH){
+  const lvl=upLvl(u.id), maxed=lvl>=u.max, afford=SAVE.coins>=u.cost && !maxed;
+  const x=20, w=CONFIG.W-40;
+  ctx.globalAlpha = maxed?0.7:1;
+  ctx.fillStyle='#1A1030'; roundRect(x,y,w,cardH,12); ctx.fill();
+  // pixel-art border (instead of the plain stroke)
+  pixelBorder(x,y,w,cardH, maxed?'#3A6A3A':(afford?'#F5C518':'#3A2F55'), 3);
+  // icon tile on the left
+  const tile=cardH-20, ix=x+12, iy=y+10;
+  ctx.fillStyle='#0E0822'; roundRect(ix,iy,tile,tile,8); ctx.fill();
+  pixelBorder(ix,iy,tile,tile,'#2A2040',2);
+  drawUpgradeIcon(u.icon, ix+tile/2, iy+tile/2, tile-16);
+  // text block
+  const tx = ix+tile+14;
+  text(u.name, tx, y+18, '#fff', 9, 'left');
+  wrapTextLeft(u.desc, tx, y+36, w - (tx-x) - 96, 12, '#9a93b0', 7);
+  text('LV '+lvl+'/'+u.max, tx, y+cardH-12, '#7a7298', 7, 'left');
+  ctx.globalAlpha=1;
+  // buy button / maxed
+  if(maxed){
+    text('MAXED', x+w-46, y+cardH/2, '#3CB371', 9, 'right');
+  } else {
+    const bw=80,bh=34,bx=x+w-bw-12,by=y+cardH/2-bh/2;
+    const bg2=afford?'#F5C518':'#2A2438', fg=afford?'#3a2c00':'#6a6080';
+    ctx.fillStyle=bg2; roundRect(bx,by,bw,bh,8); ctx.fill();
+    pixelBorder(bx,by,bw,bh, afford?'#FFE07A':'#3A2F55', 2);
+    // coin icon + cost inside the button
+    setFont(10); const cs=''+u.cost; const tw=ctx.measureText(cs).width;
+    const cd=14, gp=4, grp=cd+gp+tw, gx0=bx+bw/2-grp/2;
+    drawCoin(gx0+cd/2, by+bh/2, 6.4, 'normal');
+    text(cs, gx0+cd+gp, by+bh/2, fg, 10, 'left');
+    buttons.push({x:bx,y:by,w:bw,h:bh,fn:()=> afford? buy(u) : Audio_.buzz()});
+  }
 }
 function wrapTextLeft(str,x,y,maxw,lh,color,fs){
   setFont(fs); ctx.fillStyle=color; ctx.textAlign='left'; ctx.textBaseline='middle';
@@ -1778,19 +1945,33 @@ function drawMilestone(){
   ctx.fillStyle='rgba(5,2,12,0.86)'; ctx.fillRect(0,0,VW,CONFIG.H);
   ctx.save(); ctx.translate(OX,0);
   buttons=[];
-  text('CHOOSE YOUR BUFF', CONFIG.W/2, 120, '#F5C518', 14);
-  let y=180;
+  text('CHOOSE YOUR BUFF', CONFIG.W/2, 96, '#F5C518', 14);
+  text('TAP A BUFF, THEN CONFIRM', CONFIG.W/2, 118, '#888', 7);
+  let y=140; const h=140;
   for(const b of buffChoices){
-    const h=160;
-    ctx.fillStyle='#160E2A'; roundRect(28,y,CONFIG.W-56,h,12); ctx.fill();
-    ctx.lineWidth=3; ctx.strokeStyle=b.color; roundRect(28,y,CONFIG.W-56,h,12); ctx.stroke();
-    // buff icon
-    drawBuffIcon(b.id, CONFIG.W/2, y+34, 36, b.color);
-    text(b.name, CONFIG.W/2, y+70, '#fff', 11);
-    wrapText(b.desc, CONFIG.W/2, y+102, CONFIG.W-90, 16, '#aaa', 8);
-    buttons.push({x:28,y,w:CONFIG.W-56,h,fn:()=>applyBuff(b)});
-    y+=h+16;
+    const selected = milestoneSelected && milestoneSelected.id===b.id;
+    ctx.fillStyle = selected ? '#241845' : '#160E2A'; roundRect(28,y,CONFIG.W-56,h,12); ctx.fill();
+    pixelBorder(28,y,CONFIG.W-56,h, b.color, selected?4:3);
+    // selected check badge
+    if(selected){
+      ctx.fillStyle=b.color; ctx.beginPath(); ctx.arc(CONFIG.W-52, y+22, 11, 0, 7); ctx.fill();
+      ctx.strokeStyle='#0D0618'; ctx.lineWidth=3; ctx.lineCap='round'; ctx.lineJoin='round';
+      ctx.beginPath(); ctx.moveTo(CONFIG.W-57,y+22); ctx.lineTo(CONFIG.W-53,y+27); ctx.lineTo(CONFIG.W-47,y+17); ctx.stroke();
+    }
+    drawBuffIcon(b.id, CONFIG.W/2, y+30, 34, b.color);
+    text(b.name, CONFIG.W/2, y+64, '#fff', 10);
+    wrapText(b.desc, CONFIG.W/2, y+92, CONFIG.W-90, 15, '#aaa', 7);
+    // tapping a card only SELECTS it (prevents accidental instant-apply from a stray tap)
+    buttons.push({x:28,y,w:CONFIG.W-56,h,fn:()=>{ milestoneSelected=b; Audio_.click(); }});
+    y+=h+12;
   }
+  // CONFIRM button — only active once a buff is selected
+  const ready = !!milestoneSelected;
+  const cy = y+6;
+  button(ready?'CONFIRM':'SELECT A BUFF', 30, cy, CONFIG.W-60, 54,
+    ready?'#2ECC71':'#2A2438', ready?'#06210f':'#6a6080',
+    ()=>{ if(milestoneSelected){ const b=milestoneSelected; milestoneSelected=null; applyBuff(b); } },
+    {fs:15,r:12});
   ctx.restore();
 }
 
@@ -1839,8 +2020,11 @@ function animateCoinPanel(y){
   }
   const shown = a?a.shown:G.finalEarned;
   const disp = a?a.displayTotal:SAVE.coins;
-  drawCoin(CONFIG.W/2-40,y+56,11,'normal');
-  text('+'+shown, CONFIG.W/2+10, y+56, '#F5C518', 20);
+  // center the [coin] +N group regardless of digit count
+  const amtStr='+'+shown; setFont(20); const aw=ctx.measureText(amtStr).width;
+  const coinD=11*2.2, grpW=coinD+8+aw, gx0=CONFIG.W/2-grpW/2;
+  drawCoin(gx0+coinD/2, y+56, 11, 'normal');
+  text(amtStr, gx0+coinD+8, y+56, '#F5C518', 20, 'left');
   text('TOTAL', CONFIG.W/2, y+86, '#888', 7);
   text(disp, CONFIG.W/2, y+104, '#fff', 13);
 }
@@ -1916,16 +2100,19 @@ const POWERUP_GUIDE=[
   ['ghost','GHOST','Pass through the next 2 obstacles'],
   ['coinburst','COIN BURST','Spawns 5 bonus coins ahead'],
   ['slowfield','SLOW FIELD','Slows the world 30% for 12s'],
-  ['doublepoints','DOUBLE POINTS','Each obstacle passed scores 2x for 20s'],
+  ['doublepoints','DOUBLE SCORE','Each obstacle passed scores 2x for 20s'],
 ];
 function gearButton(cx,cy,fn){
   buttons.push({x:cx-20,y:cy-20,w:40,h:40,fn});
-  ctx.save(); ctx.fillStyle='#9aa3b8';
-  const r=11;
-  for(let a=0;a<8;a++){ const ang=a*Math.PI/4; ctx.fillRect(Math.round(cx+Math.cos(ang)*r-3), Math.round(cy+Math.sin(ang)*r-3),6,6); }
-  ctx.beginPath(); ctx.arc(cx,cy,8,0,7); ctx.fill();
-  ctx.fillStyle='#0D0618'; ctx.beginPath(); ctx.arc(cx,cy,3.5,0,7); ctx.fill();
-  ctx.restore();
+  const sz=34;
+  if(SETTINGS_REC.ready){ ctx.drawImage(SETTINGS_IMG, Math.round(cx-sz/2), Math.round(cy-sz/2), sz, sz); }
+  else { // fallback simple gear while loading
+    ctx.save(); ctx.fillStyle='#9aa3b8'; const r=11;
+    for(let a=0;a<8;a++){ const ang=a*Math.PI/4; ctx.fillRect(Math.round(cx+Math.cos(ang)*r-3), Math.round(cy+Math.sin(ang)*r-3),6,6); }
+    ctx.beginPath(); ctx.arc(cx,cy,8,0,7); ctx.fill();
+    ctx.fillStyle='#0D0618'; ctx.beginPath(); ctx.arc(cx,cy,3.5,0,7); ctx.fill();
+    ctx.restore();
+  }
 }
 function drawSettings(){
   buttons=[];
