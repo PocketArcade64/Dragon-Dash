@@ -114,10 +114,10 @@ function upLvl(id){ return SAVE.upgrades[id]||0; }
 // ---- Dragons ----
 const DRAGONS = {
   fire: { key:'fire', name:'FIRE DRAGON', ability:'SCAVENGER',
-    abilityDesc:'Clear 15 obstacles unhit -> earn 1 bonus coin. Resets on hit.',
+    abilityDesc:'Clear 15 obstacles unhit to earn 1 bonus coin. Resets on hit.',
     color:'#E74C3C', trail:'#FF7B42' },
   ice:  { key:'ice', name:'ICE DRAGON', ability:'ICE SHIELD',
-    abilityDesc:'Clear 15 obstacles unhit -> gain a 1-hit shield. Resets on hit.',
+    abilityDesc:'Clear 15 obstacles unhit to gain a 1-hit shield. Resets on hit.',
     color:'#5BC8F5', trail:'#BFEEFF' }
 };
 
@@ -671,26 +671,47 @@ function handleObstacleCollision(o, hitCeil){
   // normal hit
   takeDamage();
 }
-// Shatter one half of an obstacle (the side actually struck) into a burst of pixel debris,
-// leaving the opposite half standing. The struck half stops drawing and stops colliding.
+// Shatter one half of an obstacle (the side actually struck) into a dense cloud of pixel
+// debris that matches the destroyed column's footprint, shape (tapered toward the gap tip)
+// and biome colors — leaving the opposite half standing. The struck half stops drawing/colliding.
 function crumbleHalf(o, isCeil, b, loud){
   if(isCeil) o.topCrumbled=true; else o.botCrumbled=true;
-  if(loud){ shake=4; }
-  const w=o.w, x0=o.x - w/2;
+  if(loud) shake=Math.max(shake,5);
+  const w=o.w, cx=o.x;
   const yTop = isCeil ? CONFIG.HUD_H : o.gapY + o.gap/2;
   const yBot = isCeil ? o.gapY - o.gap/2 : CONFIG.H;
+  const colH = Math.max(PX, yBot - yTop);
   const sp = CONFIG.BASE_SPEED * ((G.mods&&G.mods.slowFactor)||1);
-  const cols=[b.oLight, b.oMid, b.oMid, b.oDark];
-  const n = 52;
-  for(let i=0;i<n;i++){
-    const px = x0 + Math.random()*w;
-    const py = yTop + Math.random()*Math.max(PX,(yBot-yTop));
-    fxParticles.push({
-      x:px, y:py,
-      vx: -sp + rnd(-2.0,2.0),
-      vy: rnd(-2.6,1.4),
-      life:1, color: cols[(Math.random()*cols.length)|0], size:PX, txt:null
-    });
+  // palette matching how this biome's obstacle is actually rendered
+  let pal;
+  if(b.tip==='forest') pal=['#D7E2BA','#A6BE80','#A6BE80','#728B4C','#C8364E','#C8364E','#E85A72','#8E2236'];
+  else pal=[b.oLight,b.oLight,b.oMid,b.oMid,b.oMid,b.oDark,b.oDark,(b.oTip||b.oMid)];
+  const accent = b.acc2 || b.accent;
+  // dense grid, but cap the budget so a tall column stays performant
+  let step = PX*2;
+  while((w/step)*(colH/step) > 460) step += PX;
+  for(let gy=yTop; gy<yBot; gy+=step){
+    // taper toward the pointed gap tip (last ~40px) so the cloud keeps the spire silhouette
+    const distTip = isCeil ? (yBot-gy) : (gy-yTop);
+    let halfW = w/2;
+    if(distTip < 40) halfW = (w/2)*(0.28 + 0.72*(distTip/40));
+    for(let gx=-halfW; gx<=halfW; gx+=step){
+      const fx = (gx + halfW) / Math.max(1, 2*halfW);   // 0..1 across the row
+      const noise = h2(o.seed, gy*0.37+gx*0.11, 5);
+      let col;
+      if(fx<0.22) col=pal[0];
+      else if(fx>0.80) col=pal[5];
+      else col=pal[2 + (noise*3|0)];
+      if(noise>0.94) col=accent;                        // occasional glowing fleck
+      const dir = gx>=0?1:-1;
+      fxParticles.push({
+        x: cx+gx+rnd(-1,1), y: gy+rnd(-1,1),
+        vx: -sp + dir*rnd(0.2,2.6) + rnd(-0.5,0.5),
+        vy: rnd(-3.2,0.9),
+        life: rnd(1.0,1.7),
+        color: col, size:(Math.random()<0.25?PX*2:PX), txt:null
+      });
+    }
   }
 }
 
@@ -741,8 +762,8 @@ function collectCoin(c){
   if(upLvl('piggyBank')>0) val*=2;
   if(G.biomeMods.goldRush) val*=2;
   G.runCoins += val;
-  if(c.kind==='ultra'){ Audio_.coin10(); explode(c.x,c.y,'#FFE680',12); }
-  else if(c.kind==='rare'){ Audio_.coin5(); explode(c.x,c.y,'#FFE680',7); }
+  if(c.kind==='ultra'){ Audio_.coin10(); explode(c.x,c.y,'#FF6B6B',12); }
+  else if(c.kind==='rare'){ Audio_.coin5(); explode(c.x,c.y,'#6FD0FF',7); }
   else Audio_.coin1();
 }
 // Pick an x just ahead of the screen that does NOT line up with any obstacle column (now or
@@ -802,7 +823,8 @@ function collectPowerup(p){
       }
       break;
   }
-  spawnText(p.type.toUpperCase(),G.x,G.y-44,'#9FE');
+  const PU_LABELS={shield:'SHIELD',magnet:'MAGNET',tiny:'TINY',ghost:'GHOST',coinburst:'COIN BURST',slowfield:'SLOW FIELD',doublepoints:'DOUBLE SCORE'};
+  spawnText(PU_LABELS[p.type]||p.type.toUpperCase(),G.x,G.y-44,'#9FE');
 }
 
 // ============================================================
@@ -1110,20 +1132,21 @@ function drawHeart(x,y,px,fill,empty){
   }
 }
 function drawCoin(x,y,r,kind){
-  const ic=ICONS.coin, d=Math.round(r*2.2);
+  // custom sprites: normal = gold, rare = blue (worth more), ultra = red (worth most)
+  const ic = kind==='ultra' ? (ICONS.coinUltra||ICONS.coin)
+           : kind==='rare'  ? (ICONS.coinRare||ICONS.coin)
+           : ICONS.coin;
+  const d=Math.round(r*2.2);
   ctx.save();
   const glow = kind==='ultra'?16:(kind==='rare'?9:0);
-  if(glow){ ctx.shadowColor = kind==='ultra'?'#C58BFF':'#A8D4FF'; ctx.shadowBlur=glow; }
+  if(glow){ ctx.shadowColor = kind==='ultra'?'#FF5A5A':'#5BC8F5'; ctx.shadowBlur=glow; }
   if(ic && ic.ready){
+    ctx.imageSmoothingEnabled=false;
     ctx.drawImage(ic.img, Math.round(x-d/2), Math.round(y-d/2), d, d);
     ctx.shadowBlur=0;
-    if(kind==='rare'||kind==='ultra'){
-      ctx.globalCompositeOperation='source-atop'; ctx.globalAlpha=0.45;
-      ctx.fillStyle = kind==='ultra'?'#9B5BFF':'#4AA8FF';
-      ctx.fillRect(Math.round(x-d/2), Math.round(y-d/2), d, d);
-    }
   } else {
-    ctx.fillStyle='#F5C518'; ctx.beginPath(); ctx.arc(x,y,r,0,7); ctx.fill(); ctx.shadowBlur=0;
+    ctx.fillStyle = kind==='ultra'?'#FF5A5A':(kind==='rare'?'#5BC8F5':'#F5C518');
+    ctx.beginPath(); ctx.arc(x,y,r,0,7); ctx.fill(); ctx.shadowBlur=0;
     ctx.fillStyle='#C99A0B'; ctx.beginPath(); ctx.arc(x,y,r*0.62,0,7); ctx.fill();
   }
   ctx.restore();
@@ -1358,12 +1381,23 @@ function drawIceColumn(o,b,topY,botY,isCeil){
     ctx.fillStyle=b.oMid;   ctx.fillRect(rowX, y, rowW, PX);            // icy body
     ctx.fillStyle=b.oLight; ctx.fillRect(rowX, y, PX*2, PX);            // bright lit rim
     ctx.fillStyle=b.oDark;  ctx.fillRect(rowX+rowW-PX*2, y, PX*2, PX);  // cool shadow edge
-    // vertical crystalline facet seams (stable)
-    if(rowW>PX*5){ ctx.fillStyle=b.oLight; ctx.globalAlpha=0.5;
-      ctx.fillRect(rowX+Math.round(rowW*0.4), y, PX, PX); ctx.globalAlpha=1; }
-    // bright sparkle flecks
+    // horizontal frost growth-bands (the layered look of a real icicle)
+    if(rowW>PX*4 && (((y/PX)|0) % 5)===0){
+      ctx.globalAlpha=0.32; ctx.fillStyle=b.oLight;
+      ctx.fillRect(rowX+PX, y, rowW-PX*2, PX); ctx.globalAlpha=1;
+    }
+    // glassy inner glints — short BROKEN dashes (never a continuous vertical line)
+    if(rowW>PX*5 && h2(o.seed,y,8)>0.55){
+      ctx.globalAlpha=0.45; ctx.fillStyle=b.acc2;
+      ctx.fillRect(rowX+PX*3, y, PX, PX); ctx.globalAlpha=1;
+    }
+    // sparkle flecks (more frequent + twinkling)
     const r=h2(o.seed, y, 13), inner=Math.max(0,rowW-PX*5);
-    if(r>0.9 && inner>0){ ctx.fillStyle=b.acc2; ctx.fillRect(rowX+PX*2+Math.round((r%0.25/0.25)*inner), y, PX, PX); }
+    if(r>0.80 && inner>0){
+      ctx.globalAlpha=0.65+0.35*Math.sin(G.frame*0.2 + y*0.3 + o.seed);
+      ctx.fillStyle=b.acc2; ctx.fillRect(rowX+PX*2+Math.round((r%0.25/0.25)*inner), y, PX, PX);
+      ctx.globalAlpha=1;
+    }
   }
   // glinting tip highlight
   const tipY = isCeil ? botY-PX*2 : topY;
@@ -1386,13 +1420,19 @@ function drawLavaColumn(o,b,topY,botY,isCeil){
     ctx.fillStyle=b.oMid;   ctx.fillRect(rowX, y, rowW, PX);            // basalt body
     ctx.fillStyle=b.oLight; ctx.fillRect(rowX, y, PX*2, PX);            // warm lit rim
     ctx.fillStyle=b.oDark;  ctx.fillRect(rowX+rowW-PX*2, y, PX*2, PX);  // charred shadow
-    // glowing molten core seam down the centre (brighter the wider the rock)
+    // twisting molten rivulet — wanders left/right as it flows down (never a straight line),
+    // and animates downward so it reads as flowing lava
     if(rowW>PX*4){
-      const coreW=Math.max(PX, Math.round(rowW*0.22));
-      ctx.globalAlpha=0.55+0.4*pulse; ctx.fillStyle=b.accent;
-      ctx.fillRect(cx-Math.round(coreW/2), y, coreW, PX);
-      ctx.globalAlpha=0.9*pulse; ctx.fillStyle=b.acc2;
-      ctx.fillRect(cx-PX/2|0, y, PX, PX); ctx.globalAlpha=1;
+      const flow = y*0.06 + G.frame*0.05;
+      const wander = Math.sin(flow)*(rowW*0.22) + Math.sin(flow*0.5 + o.seed)*(rowW*0.13);
+      const streamX = cx + wander;
+      if(streamX > rowX+PX && streamX < rowX+rowW-PX){
+        ctx.globalAlpha=0.5+0.4*pulse; ctx.fillStyle=b.accent;
+        ctx.fillRect(Math.round(streamX-PX), y, PX*2, PX);     // glowing channel
+        ctx.globalAlpha=0.85*pulse; ctx.fillStyle=b.acc2;
+        ctx.fillRect(Math.round(streamX-PX/2), y, PX, PX);     // bright molten core
+        ctx.globalAlpha=1;
+      }
     }
     // ember flecks
     const r=h2(o.seed, y, 13), inner=Math.max(0,rowW-PX*5);
@@ -1421,8 +1461,8 @@ function drawMushroomColumn(o,b,topY,botY,isCeil){
     stemTop = topY + capH; stemBot = botY;
     capTop  = topY;        capBot  = topY + capH;
   }
-  // ---- STEM (pale cream, lit-left / shadow-right) ----
-  const sLight='#F1EAD4', sMid='#D8CAA4', sDark='#A8966C', sLine='#574a30';
+  // ---- STEM (mossy green-cream, lit-left / shadow-right) — green-tinted to fit the forest ----
+  const sLight='#D7E2BA', sMid='#A6BE80', sDark='#728B4C', sLine='#2f3d1c';
   if(stemBot>stemTop){
     ctx.fillStyle=sLine;  ctx.fillRect(stemX-PX, stemTop, stemW+2*PX, stemBot-stemTop);
     ctx.fillStyle=sMid;   ctx.fillRect(stemX, stemTop, stemW, stemBot-stemTop);
@@ -1588,6 +1628,8 @@ function drawBrokenCap(o,b,x,w,capTop,capBot,isCeil){
 }
 // ---- power-up icons: uniform pixel sprites built from the reference art ----
 const ICON_B64 = {
+  coinRare:"iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAApElEQVR4nO2TTQ6DIBCFP7RLE1LWHKUcxPPqUVxrSNjThYGqM8Sm674FIS/vh8Bg0JEbvLkjMsDzpfu3ucrlBsjFuE56vQunoM9SzMVYhFesE/Rjwi5DDXm0Wo6nKCYXAH/Wd8f2a7MLkrPLQPSp3FPu9MN+j3/AHmC22eCCHKDoE9EnwTXnoB8TeOqbWwZhvkIdZU0IezDoo1xD4PfPJIIUCP0b6mZBTm0qn8YAAAAASUVORK5CYII=",
+  coinUltra:"iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAq0lEQVR4nO2TwQ3DIAxFvyu24MQUuWeDZIR0rjBCGCmnzOEeiAkxRmnvtYSQLP/HB2yCHdzJ01OCAYCXyVbH1OhcLS7CdevYmgXEAhFSFovwPdsXWDdgHIDgxQ25pkjEtYtTZIHd7XRdYDkJHtgP8DKBYuKX7fX7+AMygCim/OK6gfYjL53r9sE45F3+PPhWrKKehauVjcICRpmJWysXCPDbMDXjWYMshk58ACsPPB0ZXEI+AAAAAElFTkSuQmCC",
   shield:"iVBORw0KGgoAAAANSUhEUgAAABYAAAAWCAYAAADEtGw7AAABVklEQVR42mNkIAIwMbP+R+b/+/ubkZAeRnwGwEBW4yIU/rT6OKyGIVvIiGyof1oDAwMDA4O0tBKGplM75jIwMDAwmHkkY8gFO0DUO9vbwA1nwWbz4X2bGNh/vYbzf7KJMnA7zWJYFM/IEBWfikVHMtxwGMAw+Onl/Qx/tPMZuMW1sSpatnA2inplJQUGc1tXhmCHVtR4YaARGDWYsMEfX14lqFlZSYF2Lja3dWXo7GjFEMdIbtK6jgxPL09kKMrNZDAxQc25cQtRM6aX6Us4GzlzoLj439/fjBtnNYymCuzgzJlz1DVYWteRoW/ydLyGe5lyMazuL8SaIjDKY/Ti8+nl/QwMDAwMRbmZDAwMDAyTrhrCDWT/9ZrBzANSqqGnCKwGoxuObAEMwMpkXIbiNBi5NkG2AB5U0krwWgRXNUWw7kJ3PQMDA8PGWQ0E6z1GomKYjMoUAHk3dI0Hva3EAAAAAElFTkSuQmCC",
   magnet:"iVBORw0KGgoAAAANSUhEUgAAAB0AAAAdCAYAAABWk2cPAAABkElEQVR42r3Xv0rDQBwH8O+dIZyCS5FaSKGDTsXFtR11dCiIY2dfofgCdnTtI4hLZ+ngEziVFqQZAhaklCIU2lAjcUq4tJfcnzT+4CAhHJ+7y/1+yREYBrPsMLr2gw1B0cEsO/wJfuPGD0AliAk4dL34vuaUAQDH7FB5xjQPCADedAYAWPprqM6Y5gH5eB28Kw+eqoJvVxfCZzWnrAUqocyyw3GjitP1Nw7azdygFI1APiJ4G7y9aSpvJKID8jF6eM4Es/KYmoBPH0wKLv01ora9q2kR4ND14E1nqelETMHefJIKinY4X0Bo0aAoj+m+wLT+orSi+wRV8zgzT01mqJLHtIgldR4vMwuHtAzqgpX6Cp1+KTOt6H+DmWhRYIxW6qudB+NGFcyyQ76pgqIBJwo+s+zw/uQc3dYCX6Mj7c+ULphY3k6/JJzxvsGdd6oDm4JxwY+WOIpuayHtaAomvjI8fM3kP3UDnxiBieX1gw3pzSda79QEFP6uMMsOX6pn0o53n67xcYLIzilpkef88gf3hFCFtB9kwgAAAABJRU5ErkJggg==",
   tiny:"iVBORw0KGgoAAAANSUhEUgAAAA8AAAAPCAYAAAA71pVKAAAAr0lEQVR42qWSzQ3CMAyF/V5Q7x2BJViFHZiBG8zADohNukTFBHCOII9DAIWQpJVqKYpl5/NPbFhBSCq3hRCQ21ZWkdt+99X746n4pgqbmd0PbwhlP22BoNbzmHS9RrnnycxD48UkvAkL4Fbm+qi6LioPPw9Ol6P3/qe2jy/9OJaWY8z264x4BNVHBQdB+IMHmm0VYT2F+uAdRFIXR10Rb5KCg+ZtThKgBaIVAEKz1Bef+kQMVpZTrQAAAABJRU5ErkJggg==",
@@ -1691,7 +1733,7 @@ function drawUpgradeIcon(icon, cx, cy, size){
 }
 
 // shared power-up color map (used by floating power-ups and the HUD timer bars)
-const POWERUP_COLORS={shield:'#5BC8F5',magnet:'#E0563B',tiny:'#E74C3C',ghost:'#DCE6F2',coinburst:'#F5C518',slowfield:'#C0C7D0',doublepoints:'#F5C518'};
+const POWERUP_COLORS={shield:'#5BC8F5',magnet:'#E0563B',tiny:'#E74C3C',ghost:'#DCE6F2',coinburst:'#F5C518',slowfield:'#C0C7D0',doublepoints:'#3CEF33'};
 function drawPowerup(p){
   const col=POWERUP_COLORS[p.type]||'#fff';
   ctx.save();
@@ -1741,6 +1783,7 @@ function drawHUD(){
     ['tiny','tiny','TINY',20],
     ['slowField','slowfield','SLOW FIELD',12],
     ['doublePoints','doublepoints','DOUBLE SCORE',20],
+    ['ghost','ghost','GHOST',15],
   ];
   for(const [tkey,ikey,label,max] of tlist){ const t2=G.timers[tkey]; if(t2>0){
     const col=POWERUP_COLORS[ikey]||'#5BC8F5';
