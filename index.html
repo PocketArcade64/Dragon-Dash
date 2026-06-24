@@ -105,8 +105,8 @@ const UPGRADES = [
   {id:'coinMagnet', name:'COIN MAGNET', desc:'Small passive coin attraction', cost:25, max:1, icon:{src:'icon',key:'magnet'}},
   {id:'luckyFind',  name:'LUCKY FIND',  desc:'Power-up spawn rate +25%', cost:35, max:2, icon:{src:'shop',key:'clover'}},
   {id:'piggyBank',  name:'PIGGY BANK',  desc:'Each coin collected counts x2', cost:40, max:1, icon:{src:'shop',key:'piggy'}},
-  {id:'forgivingGap',name:'FORGIVING GAP',desc:'Hitbox 15% smaller', cost:50, max:1, icon:{src:'icon',key:'tiny'}},
-  {id:'secondWind', name:'PHOENIX UP', desc:'Once/run survive a lethal hit', cost:60, max:1, icon:{src:'shop',key:'phoenix'}},
+  {id:'forgivingGap',name:'MINIMIZE',desc:'Your dragon is 15% smaller', cost:50, max:1, icon:{src:'icon',key:'tiny'}},
+  {id:'secondWind', name:'PHOENIX UP', desc:'Once per run', cost:60, max:1, icon:{src:'shop',key:'phoenix'}},
   {id:'highBonus',  name:'HIGH SCORE BONUS', desc:'+5 coins when you achieve a top 3 highscore', cost:45, max:1, icon:{src:'shop',key:'trophy'}},
 ];
 function upLvl(id){ return SAVE.upgrades[id]||0; }
@@ -117,7 +117,7 @@ const DRAGONS = {
     abilityDesc:'Clear 15 obstacles unhit -> earn 1 bonus coin. Resets on hit.',
     color:'#E74C3C', trail:'#FF7B42' },
   ice:  { key:'ice', name:'ICE DRAGON', ability:'ICE SHIELD',
-    abilityDesc:'Survive 15 obstacles unhit -> gain a 1-hit shield. Resets on hit.',
+    abilityDesc:'Clear 15 obstacles unhit -> gain a 1-hit shield. Resets on hit.',
     color:'#5BC8F5', trail:'#BFEEFF' }
 };
 
@@ -415,6 +415,7 @@ function startRun(startBiome){
   G.gapTighten = 0;        // cumulative px reduction
   G.slipstream = 0;        // +fraction gap
   G.transition = 0;        // 0..1 crossfade progress to next biome
+  G.transitioning = false; // true during the gradual run-up to a boundary
   G.transTarget = 0;       // target biome index during transition
   G.pendingMilestone = false;
   G.secondWindUsed = false;
@@ -582,21 +583,29 @@ function update(){
   // timers tick (frames)
   for(const k in G.timers){ if(G.timers[k]>0) G.timers[k]--; }
 
-  // Begin the area transition 5 obstacles BEFORE the boundary so the new area has fully
-  // crossfaded in right around the boundary (e.g. clearly in by ~76, not ~80).
-  if(!G.pendingMilestone && G.obstPassed >= G.nextBiomeAt - 5){
+  // Area transition: begin a GRADUAL crossfade 5 obstacles before the boundary (e.g. at 70),
+  // let it build while the player clears those 5, then finalize the biome swap and open the
+  // power-up menu exactly at the boundary (e.g. 76) — not at the start of the fade.
+  if(!G.transitioning && !G.pendingMilestone && G.obstPassed >= G.nextBiomeAt - 5){
     beginTransition();
   }
-  // crossfade transition
-  if(G.transition>0 && G.transition<1){
-    G.transition += 0.02;   // ~50 frames to fully reveal the new area
-    if(G.transition>=1){
-      G.transition=1; G.biome=G.transTarget; Audio_.setBiome(G.biome);
-      if(!SAVE.unlocked[G.biome]){ SAVE.unlocked[G.biome]=true; saveAll(); }
-      G.gapTighten += CONFIG.GAP_STEP;
-      G.biomeMods = { phantomWings:false, goldRush:false };
-      G.transition=0;
-      openMilestone();
+  if(G.transitioning){
+    // ease the crossfade toward a cap just shy of complete so the new area is clearly coming
+    // in across the 5-obstacle run-up, but the final swap waits for the boundary
+    if(G.obstPassed < G.nextBiomeAt){
+      G.transition += (0.9 - G.transition)*0.04;   // smooth, gradual approach
+    } else {
+      // reached the boundary — finish the crossfade, swap biome, open the milestone menu
+      G.transition += (1 - G.transition)*0.25;
+      if(G.transition >= 0.985){
+        G.transition=1; G.biome=G.transTarget; Audio_.setBiome(G.biome);
+        if(!SAVE.unlocked[G.biome]){ SAVE.unlocked[G.biome]=true; saveAll(); }
+        G.gapTighten += CONFIG.GAP_STEP;
+        G.biomeMods = { phantomWings:false, goldRush:false };
+        G.transition=0; G.transitioning=false;
+        G.nextBiomeAt += CONFIG.BIOME_LEN;   // advance the next boundary
+        openMilestone();
+      }
     }
   }
 
@@ -607,9 +616,11 @@ function update(){
 }
 
 function beginTransition(){
-  G.pendingMilestone = true;
+  // start the gradual crossfade; keep spawning obstacles so the player still clears the
+  // final 5 before the boundary. The biome swap, boundary advance, and milestone menu all
+  // happen later, exactly when obstPassed reaches the boundary.
+  G.transitioning = true;
   G.transTarget = (G.biome+1) % BIOMES.length;
-  G.nextBiomeAt += CONFIG.BIOME_LEN;
   G.transition = 0.001;
   Audio_.transition();
 }
@@ -698,22 +709,44 @@ function collectCoin(c){
   else if(c.kind==='rare'){ Audio_.coin5(); explode(c.x,c.y,'#FFE680',7); }
   else Audio_.coin1();
 }
-// Return a y for a coin at world-x `cx` that the dragon can actually reach:
-// if any obstacle column spans cx, place the coin inside that obstacle's gap (with margin);
-// otherwise keep it in the central playable band.
+// Pick an x just ahead of the screen that does NOT line up with any obstacle column (now or
+// for the obstacles that will share that x as everything scrolls together). Because coins and
+// obstacles scroll at the same speed, a coin's x relative to the obstacle grid is fixed for
+// life, so if we spawn it in the horizontal GAP between columns it can never end up inside one.
+function burstCoinXs(n){
+  const W=CONFIG.W, OW=CONFIG.OBST_W, SP=CONFIG.OBST_SPACING;
+  const clearW = OW/2 + (CONFIG.COIN_R||10) + 10;   // half-footprint that must avoid a column
+  // collect obstacle column x's that are at/ahead of the right edge (and project the grid
+  // forward by the spawn cadence so future columns are accounted for too)
+  const cols=[];
+  for(const o of G.obstacles){ if(o.x > W-SP) cols.push(o.x); }
+  // project forward: assume the next columns continue every SP from the right-most known one
+  let base = cols.length ? Math.max(...cols) : W+OW;
+  for(let k=0;k<6;k++){ base+=SP; cols.push(base); }
+  const isClear=(x)=> cols.every(cx=>Math.abs(x-cx) > clearW);
+  const xs=[];
+  let x = W+50;
+  while(xs.length<n && x < W+50+SP*4){
+    if(isClear(x)) xs.push(x);
+    x += 26;                 // step along until we find clear slots
+  }
+  // fallback: if somehow not enough clear slots, just space them out (rare)
+  while(xs.length<n){ xs.push(W+50+xs.length*30); }
+  return xs;
+}
+// y for a burst coin at a clear x: keep it in the central playable band near the dragon
 function safeCoinY(cx){
   const COIN_R = CONFIG.COIN_R||10;
+  // if (despite clear-x selection) a column still overlaps, place inside its gap
   for(const o of G.obstacles){
-    const halfW = o.w/2 + COIN_R + 6;            // column footprint plus coin radius + margin
+    const halfW = o.w/2 + COIN_R + 6;
     if(cx > o.x-halfW && cx < o.x+halfW){
-      const margin = Math.min(o.gap*0.5 - COIN_R - 4, o.gap*0.35);
-      const m = Math.max(0, margin);
+      const m = Math.max(0, Math.min(o.gap*0.5 - COIN_R - 4, o.gap*0.35));
       return clamp(o.gapY + rnd(-m, m), CONFIG.HUD_H+COIN_R+8, CONFIG.H-COIN_R-8);
     }
   }
-  // no obstacle here — central band, biased toward the dragon's current height
   const base = (G.y!=null) ? G.y : (CONFIG.HUD_H + (CONFIG.H-CONFIG.HUD_H)/2);
-  return clamp(base + rnd(-90,90), CONFIG.HUD_H+60, CONFIG.H-60);
+  return clamp(base + rnd(-70,70), CONFIG.HUD_H+60, CONFIG.H-60);
 }
 function collectPowerup(p){
   p.dead=true; Audio_.powerup(); explode(p.x,p.y,'#fff',10);
@@ -725,11 +758,11 @@ function collectPowerup(p){
     case 'slowfield': G.timers.slowField = 12*60; break;
     case 'doublepoints': G.timers.doublePoints = 20*60; break;
     case 'coinburst':
-      // spawn 5 coins ahead, each placed in a reachable spot: if a coin's x falls inside
-      // an obstacle column, put it inside that obstacle's gap so it's never trapped behind rock.
-      for(let i=0;i<5;i++){
-        const cx = CONFIG.W+40+i*30;
-        G.coins.push({x:cx, y:safeCoinY(cx), val:1, kind:'normal', dead:false});
+      // spawn 5 coins in horizontal GAPS between obstacle columns so they're always reachable
+      // (a coin's x never lines up with a rock column, now or as the world scrolls).
+      {
+        const xs = burstCoinXs(5);
+        for(const cx of xs){ G.coins.push({x:cx, y:safeCoinY(cx), val:1, kind:'normal', dead:false}); }
       }
       break;
   }
@@ -757,6 +790,7 @@ function openMilestone(){
   }
   Audio_.gong();
   milestoneSelected=null;
+  G.pendingMilestone=true;   // pause obstacle spawning while the menu is up
   state='milestone';
 }
 function applyBuff(b){
@@ -968,18 +1002,14 @@ function button(label,x,y,w,h,bg,fg,fn,opts={}){
   else { pixelBorder(x,y,w,h, opts.border||shade(bg,1.35), opts.bp||3); }
   textCentered(label, x+w/2, y+h/2, fg, opts.fs||12);
 }
-// Draw text centered on (cx,cy) using the glyphs' true vertical extent so pixel-font labels
-// sit dead-center in a box (fixes Silkscreen's baseline sitting slightly high/low).
+// Draw text centered on (cx,cy). Silkscreen (and most pixel fonts) render their caps high
+// within the line box, so a plain 'middle' baseline looks top-heavy in a tall button. We use
+// 'middle' (well-defined across browsers) plus a small downward nudge proportional to the
+// font size, which lands the visible glyphs in the true vertical center.
+const TEXT_VCENTER_NUDGE = 0.13;  // fraction of the scaled font size
 function textCentered(str,cx,cy,color,px){
-  setFont(px); ctx.fillStyle=color; ctx.textAlign='center';
-  const m=ctx.measureText(str);
-  if(m.actualBoundingBoxAscent!=null && m.actualBoundingBoxDescent!=null){
-    ctx.textBaseline='alphabetic';
-    const yy = cy + (m.actualBoundingBoxAscent - m.actualBoundingBoxDescent)/2;
-    ctx.fillText(str,cx,yy);
-  } else {
-    ctx.textBaseline='middle'; ctx.fillText(str,cx,cy);
-  }
+  setFont(px); ctx.fillStyle=color; ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText(str, cx, cy + px*FONT_SCALE*TEXT_VCENTER_NUDGE);
 }
 // lighten a hex color by `f` for a pixel-border highlight
 function shade(hex,f){
@@ -1112,10 +1142,13 @@ function drawWorld(){
   if(G.ghost>0) alpha=0.5;
   if(G.biomeMods.phantomWings){ alpha=0.6; tint='#6FA8FF'; }
   drawDragonSprite(G.x,G.y,scale,G.dead?2:G.flapFrame,G.dead?G.deathRot:0,alpha,tint);
-  // shield ring
+  // shield ring (pixel art)
   if(G.shield>0 && !G.dead){
-    ctx.strokeStyle='#5BC8F5'; ctx.globalAlpha=0.6+0.3*Math.sin(G.frame*0.2); ctx.lineWidth=2;
-    ctx.beginPath(); ctx.arc(G.x,G.y,26*scale,0,7); ctx.stroke(); ctx.globalAlpha=1;
+    ctx.globalAlpha = 0.6 + 0.3*Math.sin(G.frame*0.2);
+    const px = Math.max(2, Math.round(2*scale));
+    const rOuter = Math.round(30*scale/px);    // ring radius in grid cells
+    pixelRing(G.x, G.y, rOuter, '#5BC8F5', px, 1);
+    ctx.globalAlpha=1;
   }
   // ancestors flame aura
   if(G.ancestorsFlame>0 && !G.dead){
@@ -1566,20 +1599,22 @@ function star(cx,cy,r,n){
 
 function drawHUD(){
   const t=SAFE_TOP;
-  // hearts (top-left, below the island) — bigger, evenly spaced, and guaranteed to fit
-  // the left HUD zone even with the max base hearts (3) plus bonus/temp hearts.
-  const total = G.maxHearts + G.tempHearts;
-  const HW = 22;                 // heart display width (bigger)
-  const ZONE_X = 10;             // left margin
-  const ZONE_W = CONFIG.W/2 - 34 - ZONE_X;   // room before the centered SCORE text
-  // even step: prefer HW + 6 gap, but compress if the row would exceed the zone
-  let step = HW + 6;
-  if(total > 1 && total*HW + (total-1)*6 > ZONE_W){
-    step = (ZONE_W - HW) / (total - 1);       // distribute evenly across the zone
-  }
+  // Hearts (top-left). Bigger and evenly spaced. The row always fits the left HUD zone no
+  // matter how many bonus/temp hearts stack up: we pick the largest heart size (capped at
+  // HMAX) that fits `total` hearts with a proportional gap, so 3 base hearts plus every
+  // possible temp heart fit perfectly without ever colliding with the centered SCORE text.
+  const total = Math.max(1, G.maxHearts + G.tempHearts);
+  const ZONE_X = 8;
+  const ZONE_W = CONFIG.W/2 - 30 - ZONE_X;   // available width before the centered SCORE text
+  const HMAX = 26;                            // preferred (big) heart size
+  const GAP_RATIO = 0.22;                     // gap as a fraction of heart size
+  const denom = total + (total-1)*GAP_RATIO;  // rowWidth = size*denom
+  const size = Math.min(HMAX, ZONE_W/denom);
+  const step = size*(1+GAP_RATIO);
+  const hy = t + 14 - size/2;                 // vertically center the bigger hearts on the SCORE line
   let hx = ZONE_X;
-  for(let i=0;i<G.maxHearts;i++){ drawHeartImg(i>=G.hearts?'empty':'full', hx, t+6, HW); hx+=step; }
-  for(let i=0;i<G.tempHearts;i++){ drawHeartImg('temp', hx, t+6, HW); hx+=step; }
+  for(let i=0;i<G.maxHearts;i++){ drawHeartImg(i>=G.hearts?'empty':'full', hx, hy, size); hx+=step; }
+  for(let i=0;i<G.tempHearts;i++){ drawHeartImg('temp', hx, hy, size); hx+=step; }
   // score (center) + best (under it)
   text('SCORE '+G.score, CONFIG.W/2, t+16, '#fff', 11);
   text('BEST '+SAVE.high, CONFIG.W/2, t+38, '#888', 7);
@@ -1716,6 +1751,20 @@ function pixelDot(cx,cy,r,color,px){
   for(let gy=-r;gy<=r;gy++){
     for(let gx=-r;gx<=r;gx++){
       if(gx*gx+gy*gy <= r*r + r*0.4){ ctx.fillRect(Math.round(cx+gx*px), Math.round(cy+gy*px), px, px); }
+    }
+  }
+}
+// hollow pixel-art circle outline: cells whose distance from center falls in the ring band
+function pixelRing(cx,cy,rOuter,color,px,band){
+  px = px||3; band = band||1;       // band = ring thickness in grid cells
+  const rо=rOuter, ri=rOuter-band;
+  ctx.fillStyle=color;
+  for(let gy=-rо;gy<=rо;gy++){
+    for(let gx=-rо;gx<=rо;gx++){
+      const d2=gx*gx+gy*gy;
+      if(d2 <= rо*rо + rо*0.4 && d2 >= ri*ri - ri*0.4){
+        ctx.fillRect(Math.round(cx+gx*px), Math.round(cy+gy*px), px, px);
+      }
     }
   }
 }
@@ -1869,7 +1918,7 @@ function drawShop(){
   // header
   text('SHOP', 20, top+26, '#F5C518', 16, 'left');
   drawCoinCounter(CONFIG.W-20, top+26, SAVE.coins, 12, 9, '#F5C518');
-  text('PERMANENT UPGRADES — KEPT FOREVER', CONFIG.W/2, top+50, '#7FB069', 7);
+  text('PERMANENT UPGRADES', CONFIG.W/2, top+50, '#7FB069', 8);
 
   // scrollable list viewport
   const viewTop=top+64, viewBot=CONFIG.H-66, viewH=viewBot-viewTop;
@@ -2137,18 +2186,20 @@ function drawSettings(){
 function drawEncyclopedia(T){
   text('ENCYCLOPEDIA', CONFIG.W/2, T+38, '#F5C518', 15);
   const viewTop=T+60, viewBot=CONFIG.H-64, viewH=viewBot-viewTop;
-  const ch=24 + POWERUP_GUIDE.length*(66+10) + 44 + BUFFS.length*(60+8);
+  const ch=24+16 + POWERUP_GUIDE.length*(66+10) + 44 + BUFFS.length*(60+8);
   const maxScroll=Math.max(0, ch-viewH);
   settingsScroll = Math.max(0, Math.min(maxScroll, settingsScroll));
   ctx.save();
   roundRect(18,viewTop-4,CONFIG.W-36,viewH+8,10); ctx.clip();
   let y=viewTop - settingsScroll;
-  text('POWER-UPS', CONFIG.W/2, y+8, '#5BC8F5', 10); y+=24;
+  text('POWER-UPS', CONFIG.W/2, y+8, '#5BC8F5', 10);
+  text('These are temporary buffs that appear at random', CONFIG.W/2, y+24, '#777', 6); y+=40;
   for(const [type,name,desc] of POWERUP_GUIDE){
     const h=66;
     ctx.fillStyle='#140C26'; roundRect(24,y,CONFIG.W-48,h,10); ctx.fill();
-    ctx.lineWidth=2; ctx.strokeStyle='#2A2040'; roundRect(24,y,CONFIG.W-48,h,10); ctx.stroke();
+    pixelBorder(24,y,CONFIG.W-48,h,'#2A2040',3);
     ctx.fillStyle='#0B0620'; roundRect(34,y+11,44,44,8); ctx.fill();
+    pixelBorder(34,y+11,44,44,'#3A2F55',2);
     drawIcon(type, 56, y+33, 40);
     text(name, 92, y+23, '#fff', 9, 'left');
     wrapTextLeft(desc, 92, y+44, CONFIG.W-92-30, 12, '#9aa', 7);
@@ -2159,8 +2210,9 @@ function drawEncyclopedia(T){
   for(const bf of BUFFS){
     const h=60;
     ctx.fillStyle='#140C26'; roundRect(24,y,CONFIG.W-48,h,10); ctx.fill();
-    ctx.lineWidth=2; ctx.strokeStyle='#2A2040'; roundRect(24,y,CONFIG.W-48,h,10); ctx.stroke();
+    pixelBorder(24,y,CONFIG.W-48,h,'#2A2040',3);
     ctx.fillStyle='#0B0620'; roundRect(34,y+8,44,44,8); ctx.fill();
+    pixelBorder(34,y+8,44,44,'#3A2F55',2);
     drawBuffIcon(bf.id, 56, y+30, 38, bf.color);
     text(bf.name, 92, y+20, '#fff', 8, 'left');
     wrapTextLeft(bf.desc, 92, y+38, CONFIG.W-92-30, 11, '#9aa', 6);
