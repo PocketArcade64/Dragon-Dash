@@ -103,10 +103,10 @@ function saveAll(){
 const UPGRADES = [
   {id:'extraHeart', name:'EXTRA HEART', desc:'+1 starting HP (max 3 total)', cost:30, max:2, icon:{src:'heart',key:'full'}},
   {id:'coinMagnet', name:'COIN MAGNET', desc:'Small passive coin attraction', cost:25, max:1, icon:{src:'icon',key:'magnet'}},
-  {id:'luckyFind',  name:'LUCKY FIND',  desc:'Power-up spawn rate +25%', cost:35, max:2, icon:{src:'shop',key:'clover'}},
+  {id:'luckyFind',  name:'LUCKY FIND',  desc:'Power-up spawn rate +5%', cost:35, max:2, icon:{src:'shop',key:'clover'}},
   {id:'piggyBank',  name:'PIGGY BANK',  desc:'Each coin collected counts x2', cost:40, max:1, icon:{src:'shop',key:'piggy'}},
   {id:'forgivingGap',name:'MINIMIZE',desc:'Your dragon is 15% smaller', cost:50, max:1, icon:{src:'icon',key:'tiny'}},
-  {id:'secondWind', name:'PHOENIX UP', desc:'Once per run', cost:60, max:1, icon:{src:'shop',key:'phoenix'}},
+  {id:'secondWind', name:'PHOENIX UP', desc:'You are revived once per run', cost:60, max:1, icon:{src:'shop',key:'phoenix'}},
   {id:'highBonus',  name:'HIGH SCORE BONUS', desc:'+5 coins when you achieve a top 3 highscore', cost:45, max:1, icon:{src:'shop',key:'trophy'}},
 ];
 function upLvl(id){ return SAVE.upgrades[id]||0; }
@@ -430,8 +430,8 @@ function startRun(startBiome){
   G.biomeMods = { phantomWings:false, goldRush:false }; // reset each biome
   G.ancestorsFlame = 0;     // remaining obstacle-destroys
   // timed power-ups
-  G.timers = { magnet:0, tiny:0, slowField:0, doublePoints:0 };
-  G.ghost = 0;              // obstacles to pass through
+  G.timers = { magnet:0, tiny:0, slowField:0, doublePoints:0, ghost:0 };
+  G.invuln = 0;             // post-hit grace frames
   G.cursedCounter = 0;
   // ability counters tracked via G.streak
   particlesBG = []; fxParticles = []; shake=0; flash=0;
@@ -445,8 +445,9 @@ function startRun(startBiome){
 // ============================================================
 function currentGap(){
   let g = CONFIG.GAP_BASE - G.gapTighten;
+  if(G.biome === BIOMES.length-1) g -= 22;   // Lava Forge is the last area — make it meaner
   g *= (1 + G.slipstream);
-  return clamp(g, 150, 360);
+  return clamp(g, 145, 360);
 }
 function spawnPair(){
   const gap = currentGap();
@@ -457,7 +458,9 @@ function spawnPair(){
     x: CONFIG.W + CONFIG.OBST_W,
     gapY: gy, gap: gap, w: CONFIG.OBST_W,
     seed: rint(1,9999),
-    scored:false, dead:false
+    biome: G.biome,                 // remember which biome's art this pair uses
+    scored:false, dead:false,
+    topCrumbled:false, botCrumbled:false, phased:false
   });
   G.obstThisBiome++;
   // coins in gap
@@ -475,7 +478,7 @@ function spawnPair(){
     }
   }
   // power-up
-  let puChance = CONFIG.POWERUP_SPAWN_CHANCE * (1 + 0.25*upLvl('luckyFind'));
+  let puChance = CONFIG.POWERUP_SPAWN_CHANCE * (1 + 0.05*upLvl('luckyFind'));
   if(Math.random() < puChance){
     const pool = ['shield','magnet','tiny','ghost','coinburst','slowfield','doublepoints'];
     let type = pool[rint(0,pool.length-1)];
@@ -545,13 +548,20 @@ function update(){
       Audio_.scoreTick();
       onObstacleCleared(o);
     }
-    // collision
+    // collision — test the ceiling half and floor half separately so we know which one was hit
     if(!o.dead){
       const within = dr > o.x - o.w/2 && dl < o.x + o.w/2;
       if(within){
-        const inGap = dt > o.gapY - o.gap/2 && db < o.gapY + o.gap/2;
-        if(!inGap){
-          handleObstacleCollision(o);
+        const overCeil  = dt <= o.gapY - o.gap/2;   // dragon overlaps the ceiling piece
+        const overFloor = db >= o.gapY + o.gap/2;   // dragon overlaps the floor piece
+        if(overCeil || overFloor){
+          if(G.timers.ghost>0){
+            // GHOST: pass straight through, leave the obstacle intact, play a phase effect once
+            if(!o.phased){ o.phased=true; ghostPhase(); }
+          } else if(G.invuln<=0){
+            if(overCeil && !o.topCrumbled){ G.invuln=22; handleObstacleCollision(o, true); }
+            else if(overFloor && !o.botCrumbled){ G.invuln=22; handleObstacleCollision(o, false); }
+          }
         }
       }
     }
@@ -620,7 +630,7 @@ function beginTransition(){
   // final 5 before the boundary. The biome swap, boundary advance, and milestone menu all
   // happen later, exactly when obstPassed reaches the boundary.
   G.transitioning = true;
-  G.transTarget = (G.biome+1) % BIOMES.length;
+  G.transTarget = Math.min(G.biome+1, BIOMES.length-1);   // final biome loops in place
   G.transition = 0.001;
   Audio_.transition();
 }
@@ -636,26 +646,52 @@ function onObstacleCleared(o){
   if(G.mods.spite && G.hearts===1 && G.maxHearts>1 && Math.random()<1/3){ addCoins(1,'spite'); }
 }
 
-function handleObstacleCollision(o){
-  // ancestors flame destroys
+function handleObstacleCollision(o, hitCeil){
+  const b = BIOMES[(o.biome!=null)?o.biome:G.biome];
+  // ancestors flame — blast the whole pair to dust on contact
   if(G.ancestorsFlame>0){
     G.ancestorsFlame--; o.dead=true; explode(o.x,o.gapY,'#FF6B1A',26); shake=4; Audio_.hit();
     return;
   }
-  // ghost
-  if(G.ghost>0){ G.ghost--; o.dead=true; return; }
-  // shield
-  if(G.shield>0){ G.shield--; o.dead=true; Audio_.shield(); explode(G.x,G.y,'#5BC8F5',14); spawnText('BLOCKED',G.x,G.y-40,'#5BC8F5'); return; }
+  // shield — block the hit; crumble just the struck half, no damage, run continues
+  if(G.shield>0){
+    G.shield--; Audio_.shield(); explode(G.x,G.y,'#5BC8F5',14); spawnText('BLOCKED',G.x,G.y-40,'#5BC8F5');
+    crumbleHalf(o, hitCeil, b, false);
+    return;
+  }
+  // from here it's a real impact — crumble the half we struck into pixels
+  crumbleHalf(o, hitCeil, b, true);
   // phantom wings (coins instead of heart)
   if(G.biomeMods.phantomWings){
-    if(G.runCoins>=5){ G.runCoins-=5; o.dead=true; flash=0.6; shake=3; Audio_.hit(); spawnText('-5',G.x,G.y-40,'#6FA8FF'); return; }
-    else { o.dead=true; doDeath(); return; }
+    if(G.runCoins>=5){ G.runCoins-=5; flash=0.6; spawnText('-5',G.x,G.y-40,'#6FA8FF'); return; }
+    else { doDeath(); return; }
   }
   // tithe bonus
   if(G.mods.tithe){ addCoins(15,'tithe'); spawnText('+15',G.x,G.y-40,'#27AE60'); }
   // normal hit
-  o.dead=true;
   takeDamage();
+}
+// Shatter one half of an obstacle (the side actually struck) into a burst of pixel debris,
+// leaving the opposite half standing. The struck half stops drawing and stops colliding.
+function crumbleHalf(o, isCeil, b, loud){
+  if(isCeil) o.topCrumbled=true; else o.botCrumbled=true;
+  if(loud){ shake=4; }
+  const w=o.w, x0=o.x - w/2;
+  const yTop = isCeil ? CONFIG.HUD_H : o.gapY + o.gap/2;
+  const yBot = isCeil ? o.gapY - o.gap/2 : CONFIG.H;
+  const sp = CONFIG.BASE_SPEED * ((G.mods&&G.mods.slowFactor)||1);
+  const cols=[b.oLight, b.oMid, b.oMid, b.oDark];
+  const n = 52;
+  for(let i=0;i<n;i++){
+    const px = x0 + Math.random()*w;
+    const py = yTop + Math.random()*Math.max(PX,(yBot-yTop));
+    fxParticles.push({
+      x:px, y:py,
+      vx: -sp + rnd(-2.0,2.0),
+      vy: rnd(-2.6,1.4),
+      life:1, color: cols[(Math.random()*cols.length)|0], size:PX, txt:null
+    });
+  }
 }
 
 function takeDamage(){
@@ -754,7 +790,7 @@ function collectPowerup(p){
     case 'shield': if(!G.mods.cursedHoard && G.shield<1){ G.shield=1; } break;
     case 'magnet': G.timers.magnet = 15*60; break;
     case 'tiny': G.timers.tiny = 20*60; break;
-    case 'ghost': G.ghost = 2; break;
+    case 'ghost': G.timers.ghost = 15*60; break;
     case 'slowfield': G.timers.slowField = 12*60; break;
     case 'doublepoints': G.timers.doublePoints = 20*60; break;
     case 'coinburst':
@@ -861,9 +897,19 @@ function explode(x,y,color,n){
   }
 }
 function spawnText(txt,x,y,color){ fxParticles.push({x,y,vx:0,vy:-0.7,life:1,color,txt,size:0}); }
+// GHOST phase: a soft ethereal puff (pale, floats outward & up, no gravity) — visually
+// distinct from the biome-colored crumble debris of a real impact.
+function ghostPhase(){
+  for(let i=0;i<16;i++){
+    const a=rnd(0,Math.PI*2), s=rnd(0.4,1.9);
+    fxParticles.push({ x:G.x, y:G.y, vx:Math.cos(a)*s, vy:Math.sin(a)*s-0.5,
+      life:1, color:(i%2?'#DCE6F2':'#9FE'), size:rnd(2,4), txt:null, noGrav:true });
+  }
+  spawnText('PHASE', G.x, G.y-40, '#DCE6F2');
+}
 function updateParticles(){
   for(const p of fxParticles){
-    p.x+=p.vx; p.y+=p.vy; if(p.txt===null){ p.vy+=0.12; } p.life-=p.txt?0.02:0.03;
+    p.x+=p.vx; p.y+=p.vy; if(p.txt===null && !p.noGrav){ p.vy+=0.12; } p.life-=p.txt?0.02:(p.noGrav?0.022:0.03);
   }
   fxParticles=fxParticles.filter(p=>p.life>0);
   // ambient drift
@@ -1002,14 +1048,20 @@ function button(label,x,y,w,h,bg,fg,fn,opts={}){
   else { pixelBorder(x,y,w,h, opts.border||shade(bg,1.35), opts.bp||3); }
   textCentered(label, x+w/2, y+h/2, fg, opts.fs||12);
 }
-// Draw text centered on (cx,cy). Silkscreen (and most pixel fonts) render their caps high
-// within the line box, so a plain 'middle' baseline looks top-heavy in a tall button. We use
-// 'middle' (well-defined across browsers) plus a small downward nudge proportional to the
-// font size, which lands the visible glyphs in the true vertical center.
-const TEXT_VCENTER_NUDGE = 0.13;  // fraction of the scaled font size
+// Draw text truly centered on (cx,cy). The robust way to vertically center text on a canvas
+// is to measure the glyph's actual ink box (not the line box) and offset the baseline so that
+// box's midpoint lands on cy. With textBaseline='alphabetic', fillText puts the baseline at
+// drawY; the glyph spans [drawY - ascent, drawY + descent], whose center is
+// drawY + (descent - ascent)/2. Setting that equal to cy gives drawY = cy + (ascent - descent)/2.
+// (An earlier 'middle' + fixed nudge was a guess that sat slightly low; this is exact per string.)
 function textCentered(str,cx,cy,color,px){
-  setFont(px); ctx.fillStyle=color; ctx.textAlign='center'; ctx.textBaseline='middle';
-  ctx.fillText(str, cx, cy + px*FONT_SCALE*TEXT_VCENTER_NUDGE);
+  setFont(px); ctx.fillStyle=color; ctx.textAlign='center'; ctx.textBaseline='alphabetic';
+  const m = ctx.measureText(str);
+  let asc = m.actualBoundingBoxAscent, desc = m.actualBoundingBoxDescent;
+  if(typeof asc!=='number' || typeof desc!=='number' || isNaN(asc) || isNaN(desc)){
+    asc = px*FONT_SCALE*0.70; desc = 0;   // fallback: approx cap height for Silkscreen
+  }
+  ctx.fillText(str, cx, cy + (asc - desc)/2);
 }
 // lighten a hex color by `f` for a pixel-border highlight
 function shade(hex,f){
@@ -1132,14 +1184,14 @@ function drawWorld(){
   // ===== centered play column =====
   ctx.save(); ctx.translate(OX,0);
 
-  for(const o of G.obstacles) drawObstacle(o,b);
+  for(const o of G.obstacles) drawObstacle(o, BIOMES[(o.biome!=null)?o.biome:G.biome]);
   for(const c of G.coins) drawCoin(c.x,c.y,CONFIG.COIN_R,c.kind);
   for(const p of G.powerups) drawPowerup(p);
 
   // dragon
   const scale=(G.timers.tiny>0?0.5:1);
   let alpha=1, tint=null;
-  if(G.ghost>0) alpha=0.5;
+  if(G.timers.ghost>0) alpha=0.5;
   if(G.biomeMods.phantomWings){ alpha=0.6; tint='#6FA8FF'; }
   drawDragonSprite(G.x,G.y,scale,G.dead?2:G.flapFrame,G.dead?G.deathRot:0,alpha,tint);
   // shield ring (pixel art)
@@ -1150,10 +1202,13 @@ function drawWorld(){
     pixelRing(G.x, G.y, rOuter, '#5BC8F5', px, 1);
     ctx.globalAlpha=1;
   }
-  // ancestors flame aura
+  // red protective ring (pixel art, matches the blue shield ring style)
   if(G.ancestorsFlame>0 && !G.dead){
-    ctx.strokeStyle='#FF6B1A'; ctx.globalAlpha=0.5+0.3*Math.sin(G.frame*0.4); ctx.lineWidth=3;
-    ctx.beginPath(); ctx.arc(G.x,G.y,30*scale,0,7); ctx.stroke(); ctx.globalAlpha=1;
+    ctx.globalAlpha=0.55+0.3*Math.sin(G.frame*0.4);
+    const px = Math.max(2, Math.round(2*scale));
+    const rOuter = Math.round(30*scale/px);
+    pixelRing(G.x, G.y, rOuter, '#FF4530', px, 1);
+    ctx.globalAlpha=1;
   }
   // (streak number above the dragon removed — was distracting)
   // fx particles
@@ -1165,7 +1220,7 @@ function drawWorld(){
   ctx.globalAlpha=1;
 
   drawHUD();
-  if(G.transition>0){ text('ENTERING '+BIOMES[G.transTarget].name, CONFIG.W/2, CONFIG.H/2, '#fff', 10); }
+  if(G.transition>0 && G.transTarget!==G.biome){ text('ENTERING '+BIOMES[G.transTarget].name, CONFIG.W/2, CONFIG.H/2, '#fff', 10); }
   if(G.countdown>0 && !G.dead){
     const secs=Math.ceil(G.countdown/60);
     text(G.countdownLabel||'GET READY', CONFIG.W/2, CONFIG.H/2-30, '#F5C518', 16);
@@ -1239,25 +1294,23 @@ function drawObstacle(o,b){
   if(o.seed===undefined) o.seed = (o.gapY*7+o.x)%997;
   const tipUp = o.gapY - o.gap/2;     // gap edge of ceiling piece (bottom)
   const tipDn = o.gapY + o.gap/2;     // gap edge of floor piece (top)
-  if(b.tip==='spike'){               // BROWN CAVE: rounded stalactites / stalagmites
-    drawCaveColumn(o,b, CONFIG.HUD_H, tipUp, true);
-    drawCaveColumn(o,b, tipDn, CONFIG.H, false);
-    return;
-  }
-  if(b.tip==='ice'){                 // ICE: frozen dripping spires (cave shape, icy theme)
-    drawIceColumn(o,b, CONFIG.HUD_H, tipUp, true);
-    drawIceColumn(o,b, tipDn, CONFIG.H, false);
-    return;
-  }
-  if(b.tip==='lava'){                // LAVA: molten basalt spires (cave shape, fiery theme)
-    drawLavaColumn(o,b, CONFIG.HUD_H, tipUp, true);
-    drawLavaColumn(o,b, tipDn, CONFIG.H, false);
-    return;
-  }
   const w=pxs(o.w), x=Math.round(o.x - w/2);
   const TIPLEN = 30;
-  drawColumn(o,b,x,w, CONFIG.HUD_H, tipUp, true,  TIPLEN);  // ceiling piece
-  drawColumn(o,b,x,w, tipDn, CONFIG.H, false, TIPLEN);      // floor piece
+  // Draw the two halves independently so a crumbled half can be omitted while the other stays.
+  if(!o.topCrumbled){                                  // CEILING piece
+    if(b.tip==='spike')       drawCaveColumn(o,b, CONFIG.HUD_H, tipUp, true);
+    else if(b.tip==='ice')    drawIceColumn(o,b, CONFIG.HUD_H, tipUp, true);
+    else if(b.tip==='lava')   drawLavaColumn(o,b, CONFIG.HUD_H, tipUp, true);
+    else if(b.tip==='forest') drawMushroomColumn(o,b, CONFIG.HUD_H, tipUp, true);
+    else                      drawColumn(o,b,x,w, CONFIG.HUD_H, tipUp, true, TIPLEN);
+  }
+  if(!o.botCrumbled){                                  // FLOOR piece
+    if(b.tip==='spike')       drawCaveColumn(o,b, tipDn, CONFIG.H, false);
+    else if(b.tip==='ice')    drawIceColumn(o,b, tipDn, CONFIG.H, false);
+    else if(b.tip==='lava')   drawLavaColumn(o,b, tipDn, CONFIG.H, false);
+    else if(b.tip==='forest') drawMushroomColumn(o,b, tipDn, CONFIG.H, false);
+    else                      drawColumn(o,b,x,w, tipDn, CONFIG.H, false, TIPLEN);
+  }
 }
 // dripping cave rock: wide base it emerges from, tapering to a rounded drip point.
 // soft shading only — no black per-pixel borders.
@@ -1349,6 +1402,63 @@ function drawLavaColumn(o,b,topY,botY,isCeil){
   const tipY = isCeil ? botY-PX*3 : topY;
   ctx.globalAlpha=0.5+0.5*pulse; ctx.fillStyle=b.acc2;
   ctx.fillRect(cx-PX, tipY, PX*2, PX*2); ctx.globalAlpha=1;
+}
+// ENCHANTED FOREST: a single tall mushroom per piece — a long pale stem rooted to the
+// ceiling/floor, topped with a domed cap (with spots + a glowing rim) at the gap-facing end.
+function drawMushroomColumn(o,b,topY,botY,isCeil){
+  topY=pxs(topY); botY=pxs(botY);
+  const w=pxs(o.w), cx=Math.round(o.x);
+  const stemW = Math.max(PX*4, pxs(w*0.5));            // slender stem (cap overhangs it)
+  const stemX = Math.round(cx - stemW/2);
+  const span = botY-topY;
+  const capH = Math.max(PX*4, Math.min(pxs(34), pxs(span*0.42)));
+  // gap-facing end carries the cap; the stem fills the rest down to the root
+  let stemTop, stemBot, capTop, capBot;
+  if(isCeil){            // rooted at ceiling (topY); cap hangs at the gap edge (botY)
+    stemTop = topY;        stemBot = botY - capH;
+    capTop  = botY - capH; capBot  = botY;
+  } else {               // rooted at floor (botY); cap sits at the gap edge (topY)
+    stemTop = topY + capH; stemBot = botY;
+    capTop  = topY;        capBot  = topY + capH;
+  }
+  // ---- STEM (pale cream, lit-left / shadow-right) ----
+  const sLight='#F1EAD4', sMid='#D8CAA4', sDark='#A8966C', sLine='#574a30';
+  if(stemBot>stemTop){
+    ctx.fillStyle=sLine;  ctx.fillRect(stemX-PX, stemTop, stemW+2*PX, stemBot-stemTop);
+    ctx.fillStyle=sMid;   ctx.fillRect(stemX, stemTop, stemW, stemBot-stemTop);
+    ctx.fillStyle=sLight; ctx.fillRect(stemX, stemTop, PX*2, stemBot-stemTop);
+    ctx.fillStyle=sDark;  ctx.fillRect(stemX+stemW-PX*2, stemTop, PX*2, stemBot-stemTop);
+    for(let yy=stemTop; yy<stemBot; yy+=PX){            // faint speckles
+      if(h2(o.seed,yy,7)>0.92){ ctx.fillStyle=sDark; ctx.fillRect(stemX+PX*2+pxs(h2(o.seed,yy,3)*(stemW-PX*4)), yy, PX, PX); }
+    }
+  }
+  drawMushroomCap(o,b,cx,w,capTop,capBot,isCeil);
+}
+function drawMushroomCap(o,b,cx,w,capTop,capBot,isCeil){
+  const cMid='#C8364E', cLight='#E85A72', cDark='#8E2236', cLine='#460f18', spot='#F3E6CF';
+  const steps=Math.max(1, Math.floor((capBot-capTop)/PX));
+  const maxHalf = w*0.62;                                 // cap is wider than the stem
+  for(let i=0;i<steps;i++){
+    // i=0 at the base (where cap meets stem), increasing toward the rounded outer edge
+    const t=i/steps;
+    let half = maxHalf*Math.sqrt(Math.max(0,1 - t*t));     // half-ellipse dome
+    half = Math.max(PX, pxs(half));
+    const rowW=half*2, rowX=Math.round(cx-half);
+    const ry = isCeil ? (capTop + i*PX) : (capBot - (i+1)*PX);  // widest at the stem base
+    ctx.fillStyle=cLine;  ctx.fillRect(rowX-PX, ry, rowW+2*PX, PX);
+    ctx.fillStyle=cMid;   ctx.fillRect(rowX, ry, rowW, PX);
+    ctx.fillStyle=cLight; ctx.fillRect(rowX, ry, PX*2, PX);            // lit rim
+    ctx.fillStyle=cDark;  ctx.fillRect(rowX+rowW-PX*2, ry, PX*2, PX);  // shaded rim
+    // pale spots scattered over the dome (stable per seed)
+    if(rowW>PX*5 && h2(o.seed, i, 6)>0.66){
+      const sx = rowX + PX*2 + pxs(h2(o.seed,i,2)*(rowW-PX*4));
+      ctx.fillStyle=spot; ctx.fillRect(sx, ry, PX, PX);
+    }
+  }
+  // glowing underside band where the cap meets the stem (enchanted accent)
+  const gy = isCeil ? capTop : capBot-PX;
+  ctx.globalAlpha=0.55+0.3*Math.sin(G.frame*0.1+o.seed); ctx.fillStyle=b.accent;
+  ctx.fillRect(Math.round(cx-w*0.4), gy, pxs(w*0.8), PX); ctx.globalAlpha=1;
 }
 function drawColumn(o,b,x,w,top,bot,isCeil,tipLen){
   top=pxs(top); bot=pxs(bot);
@@ -2146,7 +2256,7 @@ const POWERUP_GUIDE=[
   ['shield','SHIELD','Absorbs one hit'],
   ['magnet','MAGNET','Auto-collects nearby coins for 15s'],
   ['tiny','TINY','Shrinks your hitbox for 20s'],
-  ['ghost','GHOST','Pass through the next 2 obstacles'],
+  ['ghost','GHOST','Phase through obstacles for 15 seconds'],
   ['coinburst','COIN BURST','Spawns 5 bonus coins ahead'],
   ['slowfield','SLOW FIELD','Slows the world 30% for 12s'],
   ['doublepoints','DOUBLE SCORE','Each obstacle passed scores 2x for 20s'],
