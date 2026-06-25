@@ -170,7 +170,7 @@ const DRAGONS = {
     abilityDesc:'Clear 15 obstacles unhit to gain a 1-hit shield. Resets on hit.',
     color:'#5BC8F5', trail:'#BFEEFF' },
   gold: { key:'gold', name:'GILDED DRAGON', ability:'FORTUNE',
-    abilityDesc:'Every 10 coins this run upgrades the next coin to blue (5x); every 50, to red (10x).',
+    abilityDesc:'Every 10 coins collected upgrades the next coin to blue (5x); every 50, to red (10x).',
     color:'#F2B61C', trail:'#FFD968' },
   jade: { key:'jade', name:'JADE DRAGON', ability:'OVERGROWTH',
     abilityDesc:'Every power-up you collect lasts 25% longer.',
@@ -674,13 +674,13 @@ function update(){
   // Area transition: begin a GRADUAL crossfade 5 obstacles before the boundary (e.g. at 70),
   // let it build while the player clears those 5, then finalize the biome swap and open the
   // power-up menu exactly at the boundary (e.g. 76) — not at the start of the fade.
-  if(!G.transitioning && !G.pendingMilestone && G.obstPassed >= G.nextBiomeAt - 5){
+  if(!G.transitioning && !G.pendingMilestone && G.score >= G.nextBiomeAt - 5){
     beginTransition();
   }
   if(G.transitioning){
     // ease the crossfade toward a cap just shy of complete so the new area is clearly coming
     // in across the 5-obstacle run-up, but the final swap waits for the boundary
-    if(G.obstPassed < G.nextBiomeAt){
+    if(G.score < G.nextBiomeAt){
       G.transition += (0.9 - G.transition)*0.04;   // smooth, gradual approach
     } else {
       // reached the boundary — finish the crossfade, swap biome, open the milestone menu
@@ -1504,9 +1504,6 @@ function drawIceColumn(o,b,topY,botY,isCeil){
       }
     }
   }
-  // glinting tip highlight (static — no per-frame flicker)
-  const tipY = isCeil ? botY-PX*2 : topY;
-  ctx.fillStyle=b.acc2; ctx.fillRect(cx-PX, tipY, PX*2, PX);
 }
 // LAVA: molten basalt spire — dark charred rock with a STATIONARY pixel-art network of
 // branching lava veins baked into it (deterministic per seed; no flowing animation).
@@ -1529,32 +1526,38 @@ function drawLavaColumn(o,b,topY,botY,isCeil){
     const r=h2(o.seed, y, 7), inner=Math.max(0,rowW-PX*5);
     if(r<0.10 && inner>0){ ctx.fillStyle=b.oDark; ctx.fillRect(rowX+PX*2+Math.round((r*9%1)*inner), y, PX, PX); }
   }
-  // ---- branching molten veins (stationary artwork) ----
-  lavaVein(o,b,cx,maxHalf,attach,len,pxs(topY),botY,
-           cx + (h2(o.seed,1,2)-0.5)*maxHalf*0.4,
-           attach===topY ? pxs(topY)+PX : botY-PX,
-           (h2(o.seed,2,3)-0.5)*0.5, Math.floor(len*0.95/PX), PX*2, 0);
+  // ---- molten veins: a few clean, smoothly-curving channels (stationary artwork) ----
+  // The main channel runs the full spire; 1-2 shorter side channels read as branches.
+  // Driven by attach/direction so ceiling and floor pieces are treated identically.
+  lavaChannel(o,b,cx,maxHalf,attach,pxs(topY),botY,len, 0.00, 0.97, PX*2, 0);            // main vein
+  lavaChannel(o,b,cx,maxHalf,attach,pxs(topY),botY,len, 0.26, 0.82, PX,   1);            // side branch
+  if(h2(o.seed,8,8) > 0.45)
+    lavaChannel(o,b,cx,maxHalf,attach,pxs(topY),botY,len, 0.12, 0.58, PX,  2);            // occasional 2nd branch
 }
-// One molten vein that snakes toward the tip and recursively forks — fully deterministic.
-function lavaVein(o,b,cx,maxHalf,attach,len,topY,botY, x,y, slope, length, thick, depth){
-  const dirY = (attach===topY) ? PX : -PX;
-  for(let i=0;i<length;i++){
-    y += dirY;
-    x += slope*PX + (h2(o.seed, y, depth*4+3)-0.5)*1.3*PX;   // stationary wander (no frame term)
-    if(y<topY || y>=botY) break;
-    const t=Math.min(1, Math.abs((y+PX/2)-attach)/len);
-    const hw=Math.max(PX, Math.round(spireHalfWidth(o,maxHalf,t,y)));
-    const maxOff=Math.max(0, hw-PX);
-    if(maxOff<PX) break;                       // spire too thin here to carry a vein
-    if(x > cx+maxOff) x = cx+maxOff;           // hug the inner edge rather than breaking off
+// One smooth molten channel from base (p=0, wide end) toward the tip (p=1). Deterministic
+// per seed: a gentle sine sway whose amplitude tapers with the spire so it always stays in
+// the rock and converges near the tip. No recursion, no per-frame term — clean and stable.
+function lavaChannel(o,b,cx,maxHalf,attach,topY,botY,len, p0,p1, thick, k){
+  const dirDown = (attach===topY);
+  const phase = h2(o.seed,k,1)*6.2832;
+  const freq  = 1.2 + h2(o.seed,k,2)*0.9;     // gentle waviness (low = calm)
+  const amp   = 0.30 + h2(o.seed,k,3)*0.22;   // sway as a fraction of usable half-width
+  const bias  = (h2(o.seed,k,4)-0.5)*0.5;     // slight lean to one side
+  const N = Math.max(1, Math.round((p1-p0)*len/PX));
+  for(let i=0;i<=N;i++){
+    const p = p0 + (p1-p0)*(i/N);
+    let y = dirDown ? attach + p*len : attach - p*len;
+    y = Math.round(y/PX)*PX;
+    if(y<topY || y>=botY) continue;
+    const t = Math.min(1, p);
+    const hw = Math.max(PX, spireHalfWidth(o,maxHalf,t,y));
+    const inner = Math.max(0, hw - PX*1.5);                 // keep the vein off the lit/charred rim
+    let x = cx + (Math.sin(phase + p*freq*6.2832)*amp + bias) * inner;
+    const maxOff = Math.max(0, hw-PX);
+    if(x > cx+maxOff) x = cx+maxOff;
     if(x < cx-maxOff) x = cx-maxOff;
-    ctx.fillStyle=b.accent; ctx.fillRect(Math.round(x-thick/2), y, thick, PX);     // glowing channel
+    ctx.fillStyle=b.accent; ctx.fillRect(Math.round(x-thick/2), y, thick, PX);            // glowing channel
     if(thick>=PX*2){ ctx.fillStyle=b.acc2; ctx.fillRect(Math.round(x-PX/2), y, PX, PX); } // bright core
-    // fork off a thinner branch
-    if(depth<2 && i>2 && h2(o.seed, y, depth*11+7) > 0.82){
-      const side=(h2(o.seed,y,13)>0.5)?1:-1;
-      lavaVein(o,b,cx,maxHalf,attach,len,topY,botY, x, y, side*0.9, Math.floor(length*0.45), Math.max(PX,thick-PX), depth+1);
-    }
   }
 }
 // ENCHANTED FOREST: a single tall mushroom per piece — a long pale stem rooted to the
@@ -1846,11 +1849,12 @@ function drawUpgradeIcon(icon, cx, cy, size){
 const POWERUP_COLORS={shield:'#5BC8F5',magnet:'#E0563B',tiny:'#E74C3C',ghost:'#DCE6F2',coinburst:'#F5C518',slowfield:'#C0C7D0',doublepoints:'#3CEF33'};
 function drawPowerup(p){
   const col=POWERUP_COLORS[p.type]||'#fff';
+  const R = Math.round((CONFIG.POWERUP_R+5)/PX);          // radius in grid cells
+  // snap the center to an integer so the pixel grid is symmetric about it (no jitter, centered)
+  const Cx = Math.round(p.x - PX/2), Cy = Math.round(p.y - PX/2);
   ctx.save();
-  // pixel-art circle backing (blocky filled disc + crisp ring), static so it never flickers
-  const R = Math.round((CONFIG.POWERUP_R+5)/PX);   // radius in grid cells
-  ctx.globalAlpha=0.28; pixelDot(p.x, p.y, R, col, PX);
-  ctx.globalAlpha=0.85; pixelRing(p.x, p.y, R, col, PX, 1);
+  ctx.globalAlpha=0.16; pixelDot(Cx, Cy, R, col, PX);     // translucent filled disc
+  ctx.globalAlpha=0.40; pixelRing(Cx, Cy, R, col, PX, 1); // slightly stronger rim
   ctx.globalAlpha=1;
   drawIcon(p.type, p.x, p.y, 30);
   ctx.restore();
@@ -2128,11 +2132,6 @@ function drawBiomePreview(b,x,y,w,h){
   ctx.restore();
   ctx.strokeStyle='#2A2040'; ctx.lineWidth=2; roundRect(x,y,w,h,6); ctx.stroke();
 }
-function drawNoBoostIcon(cx,cy,color){
-  pixelRing(cx,cy,3,color,2,1);                 // hollow circle
-  ctx.fillStyle=color;
-  for(let i=-2;i<=2;i++){ ctx.fillRect(Math.round(cx+i*2-1), Math.round(cy-i*2-1), 2, 2); }  // slash
-}
 function drawEnvSelect(){
   buttons=[];
   const T=SAFE_TOP;
@@ -2141,13 +2140,13 @@ function drawEnvSelect(){
   let y = T+56;
   // ---- START BOOST (right below the title) ----
   {
-    const bx=22, bw=CONFIG.W-44, bh=92, by=y;
+    const bx=22, bw=CONFIG.W-44, bh=100, by=y;
     ctx.fillStyle='#160E2A'; roundRect(bx,by,bw,bh,12); ctx.fill();
     pixelBorder(bx,by,bw,bh, starterPowerup? '#F5C518' : '#3A2F55', 3);
     text('START BOOST', bx+12, by+15, '#F5C518', 8, 'left');
     text('LASTS ONE RUN', bx+12, by+27, '#6A6A82', 6, 'left');
     drawCoinCounter(bx+bw-12, by+16, SAVE.coins, 8, 6, '#F5C518');
-    const items = STARTERS.concat([{type:null, label:'NONE'}]);
+    const items = [{type:null, label:'NO BOOST'}].concat(STARTERS);   // NO BOOST is the leftmost tile
     const n=items.length, padL=12, padR=12, gap=7, rowY=by+38, rowH=bh-38-10;
     const tileW=(bw-padL-padR-(n-1)*gap)/n;
     for(let i=0;i<n;i++){
@@ -2157,15 +2156,16 @@ function drawEnvSelect(){
       ctx.globalAlpha=(afford||selected)?1:0.4;
       ctx.fillStyle = selected? '#33290A' : '#0E0822'; roundRect(tx,rowY,tileW,rowH,7); ctx.fill();
       pixelBorder(tx,rowY,tileW,rowH, selected? '#F5C518' : '#2A2040', 2);
+      const cxT=tx+tileW/2, col = selected?'#F5C518':'#8a93b0';
       if(isNone){
-        drawNoBoostIcon(tx+tileW/2, rowY+15, selected?'#F5C518':'#8a93b0');
-        text('NO BOOST', tx+tileW/2, rowY+rowH-9, selected?'#F5C518':'#8a93b0', 6);
+        text('NO', cxT, rowY+rowH/2-8, col, 8);
+        text('BOOST', cxT, rowY+rowH/2+8, col, 8);
       } else {
-        drawIcon(it.type, tx+tileW/2, rowY+15, 19);
-        text(it.dur, tx+tileW/2, rowY+29, '#8a93b0', 6);
-        setFont(7); const cs=''+it.cost, tw=ctx.measureText(cs).width, cd=9, gp=2, grp=cd+gp+tw, gx0=tx+tileW/2-grp/2;
-        drawCoin(gx0+cd/2, rowY+rowH-9, 4.4, 'normal');
-        text(cs, gx0+cd+gp, rowY+rowH-9, selected?'#F5C518':'#cbb', 7, 'left');
+        drawIcon(it.type, cxT, rowY+15, 18);
+        text(it.dur, cxT, rowY+33, '#8a93b0', 6);
+        setFont(7); const cs=''+it.cost, tw=ctx.measureText(cs).width, cd=9, gp=2, grp=cd+gp+tw, gx0=cxT-grp/2;
+        drawCoin(gx0+cd/2, rowY+rowH-10, 4.4, 'normal');
+        text(cs, gx0+cd+gp, rowY+rowH-10, selected?'#F5C518':'#cbb', 7, 'left');
       }
       ctx.globalAlpha=1;
       buttons.push({x:tx,y:rowY,w:tileW,h:rowH,fn:()=>{
@@ -2222,7 +2222,7 @@ function drawDragonCard(key,x,y,w,h){
     text(pre, gx0, by+bh/2, fg, 9, 'left');
     drawCoin(gx0+tw1+cd/2, by+bh/2, 6, 'normal');
     text(cs, gx0+tw1+cd+gp, by+bh/2, fg, 9, 'left');
-    buttons.push({x,y,w,h,fn:()=> unlockDragon(key)});
+    buttons.push({x:bx,y:by,w:bw,h:bh,fn:()=> unlockDragon(key)});   // must tap the button to buy
   }
 }
 function unlockDragon(key){
