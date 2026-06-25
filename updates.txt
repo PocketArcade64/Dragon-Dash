@@ -1,0 +1,20 @@
+Please make these updates next:
+1. The text is still not centered on the buttons in game! - please pay careful attention or redo your approach on how this is calculated. All button the text is slightly below the center positioned vertically.
+2. make enchanted forest have mushrooms with long stems as the obstacles
+3. change Ghost power up to 15 seconds and when you hit an object as the ghost - phase through it and show a different animation than when you hit an obstacle. 
+4. When you hit an obstacle, create a new animation to only make the one you hit crumble into a bunch of pixels (if you only hit the bottom one than the top one stats intact). 
+5. The red shield that you get from the dragon blood should be pixel art
+6. the lava should not loop back into brown cave - the lava should loop endlessly when you reach it 
+6.5 make the gaps in the lava slightly tighter (this is the last area so it should be difficult)
+7. when picking the power up after transitioning into a new area the obstacles abruptly change after the menu closes down
+8. change phoenix up wording to “You are revived once per run,” 
+9. make lucky upgrade only increase by 5% per level
+
+make different color sprites for the different coins
+
+When purchasing dragons, change it so you have to click the purchase button to actually purchase it. 
+The rose dragon’s incrementing the score does not work with transitioning the areas correctly, 
+gilded dragon fix the wording - every 10 coins collected …, 
+for the start boost have the left most option be No Boost text without an icon - No is on the first line and Boost is on the second line within that box - also 1 hit and 60s is clipping the text of how many coins it costs
+remove the out of place 2x1 white squares at the tips of the ice obstacles (keep the rest of the ice the same - it looks great!. 
+The fire obstacles attached to the ceiling still do not have any lava veins like the bottom ones do. Some of the lava vein designs are too hectic - please assume the position of an expert pixel art designer and refine those lava veins
