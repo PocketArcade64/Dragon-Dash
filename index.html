@@ -476,7 +476,6 @@ function startRun(startBiome){
   G.hearts = mh; G.maxHearts = mh; G.tempHearts = 0;
   G.shield = (SAVE.dragon==='ice')?0:0;
   G.score = 0; G.runCoins = 0; G.streak = 0;
-  G.progress = 0;   // monotonic area-progress (never decreases); drives biome transitions
   G.obstacles = []; G.coins = []; G.powerups = [];
   G.distSinceObst = CONFIG.OBST_SPACING; // spawn soon
   G.scroll = 0; G.bgScroll = 0;
@@ -626,13 +625,10 @@ function update(){
     // scoring
     if(!o.scored && o.x + o.w/2 < G.x){
       o.scored = true;
-      // DOUBLE POINTS: each obstacle passed counts for 2 — toward score AND area progression,
-      // so areas transition sooner while it's active. Coins are unaffected.
-      const pts = (G.timers.doublePoints>0) ? 2 : 1;
-      const gain = pts + (G.resilienceBonus||0);   // RESILIENCE adds a flat per-obstacle bonus
+      // DOUBLE POINTS doubles the whole per-obstacle take (base + any Resilience bonus).
+      const dbl = (G.timers.doublePoints>0) ? 2 : 1;
+      const gain = (1 + (G.resilienceBonus||0)) * dbl;
       G.score += gain;
-      G.progress += gain;       // area progress only ever climbs (immune to score penalties)
-      G.obstPassed += pts;      // drives biome progression — doubled during Double Points
       Audio_.scoreTick();
       onObstacleCleared(o);
     }
@@ -681,18 +677,15 @@ function update(){
   // timers tick (frames)
   for(const k in G.timers){ if(G.timers[k]>0){ G.timers[k]--; if(G.timers[k]===0 && G.timerPeak) G.timerPeak[k]=0; } }
 
-  // Area transition: begin a GRADUAL crossfade 5 obstacles before the boundary (e.g. at 70),
-  // let it build while the player clears those 5, then finalize the biome swap and open the
-  // power-up menu exactly at the boundary (e.g. 76) — not at the start of the fade.
-  if(!G.transitioning && !G.pendingMilestone && G.progress >= G.nextBiomeAt - 5){
+  // Area transition is driven by SCORE: begin a gradual crossfade 5 points before the boundary,
+  // and only finalize the biome swap once the SCORE actually reaches the boundary. Because the
+  // boundary (nextBiomeAt) advances on finalize, re-crossing an old boundary never re-triggers.
+  // If score drops back out of the run-up (e.g. an Ironclad bump) the fade aborts cleanly.
+  if(!G.transitioning && !G.pendingMilestone && G.score >= G.nextBiomeAt - 5){
     beginTransition();
   }
   if(G.transitioning){
-    // ease the crossfade toward a cap just shy of complete so the new area is clearly coming
-    // in across the 5-obstacle run-up, but the final swap waits for the boundary
-    if(G.progress < G.nextBiomeAt){
-      G.transition += (0.9 - G.transition)*0.04;   // smooth, gradual approach
-    } else {
+    if(G.score >= G.nextBiomeAt){
       // reached the boundary — finish the crossfade, swap biome, open the milestone menu
       G.transition += (1 - G.transition)*0.25;
       if(G.transition >= 0.985){
@@ -704,6 +697,12 @@ function update(){
         G.nextBiomeAt += CONFIG.BIOME_LEN;   // advance the next boundary
         openMilestone();
       }
+    } else if(G.score >= G.nextBiomeAt - 7){
+      G.transition += (0.9 - G.transition)*0.04;   // building during the run-up
+    } else {
+      // score fell back below the run-up window — abort the fade-in (no glitchy hang)
+      G.transition += (0 - G.transition)*0.15;
+      if(G.transition < 0.03){ G.transition=0; G.transitioning=false; }
     }
   }
 
@@ -1318,8 +1317,16 @@ function drawWorld(){
   const scale=(G.timers.tiny>0?0.5:1);
   let alpha=1, tint=null;
   if(G.timers.ghost>0) alpha=0.5;
-  if(G.biomeMods.phantomWings){ alpha=0.6; tint='#6FA8FF'; }
+  if(G.biomeMods.phantomWings) alpha=Math.min(alpha,0.6);   // ethereal look (no box tint)
   drawDragonSprite(G.x,G.y,scale,G.dead?2:G.flapFrame,G.dead?G.deathRot:0,alpha,tint);
+  // PHANTOM WINGS aura — a soft pixel-art ring, distinct from the cyan shield ring
+  if(G.biomeMods.phantomWings && !G.dead){
+    ctx.globalAlpha = 0.45 + 0.25*Math.sin(G.frame*0.12);
+    const px = Math.max(2, Math.round(2*scale));
+    const rOuter = Math.round(34*scale/px);
+    pixelRing(G.x, G.y, rOuter, '#6FA8FF', px, 1);
+    ctx.globalAlpha=1;
+  }
   // shield ring (pixel art)
   if(G.shield>0 && !G.dead){
     ctx.globalAlpha = 0.6 + 0.3*Math.sin(G.frame*0.2);
@@ -1356,7 +1363,12 @@ function drawWorld(){
 
   // ===== full-screen tints =====
   if(G.mods.foolBargain){ vignette('rgba(40,90,200,0.20)'); }
-  if(G.biomeMods.goldRush){ ctx.globalAlpha=0.08+0.04*Math.sin(G.frame*0.1); ctx.fillStyle='#F5C518'; ctx.fillRect(0,0,VW,CONFIG.H); ctx.globalAlpha=1; }
+  if(G.biomeMods.goldRush){
+    // subtle static gold aura at the screen edges (no full-screen flashing)
+    const g=ctx.createRadialGradient(VW/2,CONFIG.H/2,CONFIG.H*0.34,VW/2,CONFIG.H/2,CONFIG.H*0.62);
+    g.addColorStop(0,'rgba(245,197,24,0)'); g.addColorStop(1,'rgba(245,197,24,0.14)');
+    ctx.fillStyle=g; ctx.fillRect(0,0,VW,CONFIG.H);
+  }
   if(flash>0){ ctx.globalAlpha=flash; ctx.fillStyle='#FF0000'; ctx.fillRect(0,0,VW,CONFIG.H); ctx.globalAlpha=1; }
 }
 function vignette(col){
@@ -1542,38 +1554,35 @@ function drawLavaColumn(o,b,topY,botY,isCeil){
     const r=h2(o.seed, y, 7), inner=Math.max(0,rowW-PX*5);
     if(r<0.10 && inner>0){ ctx.fillStyle=b.oDark; ctx.fillRect(rowX+PX*2+Math.round((r*9%1)*inner), y, PX, PX); }
   }
-  // ---- molten veins: a few clean, smoothly-curving channels (stationary artwork) ----
-  // The main channel runs the full spire; 1-2 shorter side channels read as branches.
-  // Driven by attach/direction so ceiling and floor pieces are treated identically.
-  lavaChannel(o,b,cx,maxHalf,attach,pxs(topY),botY,len, 0.00, 0.97, PX*2, 0);            // main vein
-  lavaChannel(o,b,cx,maxHalf,attach,pxs(topY),botY,len, 0.26, 0.82, PX,   1);            // side branch
-  if(h2(o.seed,8,8) > 0.45)
-    lavaChannel(o,b,cx,maxHalf,attach,pxs(topY),botY,len, 0.12, 0.58, PX,  2);            // occasional 2nd branch
+  // ---- molten veins: a thick trunk emerges from the rock face and forks toward the tip into
+  // two branches (like the reference volcano). Direction is passed explicitly (isCeil) so ceiling
+  // pieces render the same as floor pieces.
+  lavaChannel(o,b,cx,maxHalf,attach,pxs(topY),botY,len,isCeil, 0.00, 0.98, PX*3, 0,  0.0);  // trunk
+  lavaChannel(o,b,cx,maxHalf,attach,pxs(topY),botY,len,isCeil, 0.16, 0.78, PX*2, 1, -0.85); // left fork
+  lavaChannel(o,b,cx,maxHalf,attach,pxs(topY),botY,len,isCeil, 0.20, 0.86, PX*2, 2, +0.85); // right fork
 }
-// One smooth molten channel from base (p=0, wide end) toward the tip (p=1). Deterministic
-// per seed: a gentle sine sway whose amplitude tapers with the spire so it always stays in
-// the rock and converges near the tip. No recursion, no per-frame term — clean and stable.
-function lavaChannel(o,b,cx,maxHalf,attach,topY,botY,len, p0,p1, thick, k){
-  const dirDown = (attach===topY);
+// One molten channel from the rock face (p=0, wide end) toward the tip (p=1). 'lean' spreads
+// forks outward as they descend; a gentle sine adds organic wiggle. Deterministic, no animation.
+function lavaChannel(o,b,cx,maxHalf,attach,topY,botY,len,isCeil, p0,p1, thick, k, lean){
   const phase = h2(o.seed,k,1)*6.2832;
-  const freq  = 1.2 + h2(o.seed,k,2)*0.9;     // gentle waviness (low = calm)
-  const amp   = 0.30 + h2(o.seed,k,3)*0.22;   // sway as a fraction of usable half-width
-  const bias  = (h2(o.seed,k,4)-0.5)*0.5;     // slight lean to one side
+  const freq  = 1.0 + h2(o.seed,k,2)*0.8;
+  const amp   = 0.18 + h2(o.seed,k,3)*0.14;
   const N = Math.max(1, Math.round((p1-p0)*len/PX));
   for(let i=0;i<=N;i++){
     const p = p0 + (p1-p0)*(i/N);
-    let y = dirDown ? attach + p*len : attach - p*len;
+    let y = isCeil ? attach + p*len : attach - p*len;   // explicit direction — fixes ceilings
     y = Math.round(y/PX)*PX;
     if(y<topY || y>=botY) continue;
-    const t = Math.min(1, p);
-    const hw = Math.max(PX, spireHalfWidth(o,maxHalf,t,y));
-    const inner = Math.max(0, hw - PX*1.5);                 // keep the vein off the lit/charred rim
-    let x = cx + (Math.sin(phase + p*freq*6.2832)*amp + bias) * inner;
+    const hw = Math.max(PX, spireHalfWidth(o,maxHalf,Math.min(1,p),y));
+    const inner = Math.max(0, hw - PX*1.5);
+    let x = cx + (lean*p + Math.sin(phase + p*freq*6.2832)*amp) * inner;
     const maxOff = Math.max(0, hw-PX);
     if(x > cx+maxOff) x = cx+maxOff;
     if(x < cx-maxOff) x = cx-maxOff;
-    ctx.fillStyle=b.accent; ctx.fillRect(Math.round(x-thick/2), y, thick, PX);            // glowing channel
-    if(thick>=PX*2){ ctx.fillStyle=b.acc2; ctx.fillRect(Math.round(x-PX/2), y, PX, PX); } // bright core
+    const th = Math.min(thick, Math.max(PX, Math.round(hw*2 - PX*2)));   // never wider than the rock
+    ctx.fillStyle=b.accent; ctx.fillRect(Math.round(x-th/2), y, th, PX);               // orange channel
+    if(th>=PX*2){ ctx.fillStyle=b.acc2;     ctx.fillRect(Math.round(x-PX), y, PX*2, PX); } // molten core
+    if(th>=PX*3){ ctx.fillStyle='#FFE7A0';  ctx.fillRect(Math.round(x-PX/2), y, PX, PX); } // white-hot center
   }
 }
 // ENCHANTED FOREST: a single tall mushroom per piece — a long pale stem rooted to the
