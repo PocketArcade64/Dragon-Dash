@@ -2782,7 +2782,10 @@ function drawResetMenu(T){
 }
 function doResetProgress(){
   SAVE.coins=0; SAVE.high=0; SAVE.board=[]; SAVE.upgrades={};
-  SAVE.unlocked=[true,false,false,false,false]; saveAll();
+  SAVE.unlocked=[true,false,false,false,false];
+  SAVE.dragonsUnlocked={fire:true, ice:true};   // re-lock the purchasable dragons
+  SAVE.dragon='fire';                            // back to a free starter
+  saveAll();
   Audio_.buzz(); settingsView='main';
 }
 function drawDevMenu(T){
